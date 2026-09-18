@@ -103,9 +103,11 @@ Copy-Item .env.example .env      # 然后把两个 token 改成随机值
 （`AcePanel` 和它的 80/443 完全不碰）。起容器前会先用一次性容器跑 `nginx -t`，
 配置有问题就直接退出，现有容器保持原样。
 
-> ⚠️ 每次部署都会 `--force-recreate` 重建两个容器（MediaMTX 只在启动时读配置，
-> 不重建等于没改）。**正在推流时会有 2-5 秒中断**：OBS 一般会自动重连，
-> 没接上就点一下「开始推流」。
+> **部署不会随便打断直播**：脚本先比对渲染结果的 md5 和主机上那份，一致就只原地替换
+> 前端产物（`find -delete` + `cp -a`，保持目录 inode，bind mount 才不会失效），
+> 容器一动不动；只有 `mediamtx.yml` / `nginx.conf` 真的变了才 `--force-recreate`
+> （MediaMTX 只在启动时读配置，不重建等于没改），那一刻会有 2-5 秒中断，
+> OBS 一般会自动重连，没接上就点一下「开始推流」。
 
 轮换与开关（都改 `.env` 后重跑 `deploy.ps1 -SkipBuild`）：
 
@@ -130,8 +132,10 @@ node scripts/check-obs.mjs       # 从 OBS 日志核对 B 帧/码率/Opus 是否
 `e2e.mjs` 用真实浏览器自己合成一路 WHIP 推流（canvas 画方块 + 振荡器出 440Hz，
 强制 H.264 + Opus，和 OBS 的路径一致），不碰你的屏幕，也不需要 OBS 在场。
 
-> ⚠️ **跑 e2e / load-test 前先停掉 OBS**：MediaMTX 的 `overridePublisher` 默认是 true，
-> 合成的推流会把正在推的 OBS **顶下线**。验证完再点「开始推流」即可。
+> ⚠️ **正在直播时 e2e 会拒绝运行**：MediaMTX 的 `overridePublisher` 默认是 true，
+> 合成推流会把正在推的 OBS **顶下线**（实测约 2 秒后 OBS 才自动重连，观众会断一下）。
+> 脚本会先探一下房间里有没有流，有就退出并提示；确实要顶掉时加 `--force`。
+> `load-test.mjs` 只收不推，不受影响。
 
 **实测结果（2026-09-19）**：
 

@@ -3,7 +3,7 @@
 # screen-share 服务器侧安装脚本（幂等）。
 # 由 deploy/deploy.ps1 推到 /srv/screen-share 后调用，也可以手动重跑。
 #
-# 用法: bash remote-install.sh <api_port> <public_port> <public_host> <udp_port>
+# 用法: bash remote-install.sh <api_port> <public_port> <public_host> <udp_port> [--no-recreate]
 #
 # 原则：只新增/覆盖 screen-share 自己的文件，**不动**这台机器上任何现存服务
 # （尤其 AcePanel 和它占用的 80/443/443udp），也不删改 ufw 里既有的规则。
@@ -13,6 +13,8 @@ API_PORT="${1:?需要 api 端口}"
 PUBLIC_PORT="${2:?需要对外端口}"
 PUBLIC_HOST="${3:?需要对外地址}"
 UDP_PORT="${4:?需要 WebRTC 媒体端口}"
+NO_RECREATE=0
+if [ "${5:-}" = "--no-recreate" ]; then NO_RECREATE=1; fi
 
 APP_DIR=/srv/screen-share
 
@@ -55,10 +57,23 @@ if ! docker run --rm -v "$APP_DIR/nginx.conf:/etc/nginx/conf.d/default.conf:ro" 
   die "nginx 配置有问题（见上面的 nginx -t 输出），没有动任何现有容器"
 fi
 echo "    nginx 配置校验通过"
-# 必须 --force-recreate：mediamtx.yml / nginx.conf 都是 bind mount，
-# 而 MediaMTX **只在启动时读配置**、nginx 也只在启动时读挂载进来的那份。
-# 不重建容器的话新配置根本不生效（日志时间戳会出卖你）。和 frpc 是同一个坑。
-docker compose up -d --force-recreate --remove-orphans
+
+if [ "$NO_RECREATE" = "1" ]; then
+  # 配置和上次一模一样，只有前端产物变了 —— 静态文件是 bind mount，原地替换即时生效，
+  # 重建容器纯属多余，而且会把正在推的 OBS 流打断。只在容器确实没在跑时才补一次 up。
+  running=$(docker compose ps --status running -q | wc -l)
+  if [ "$running" = "2" ]; then
+    echo "    配置未变，容器保持不动（不打断推流）"
+  else
+    warn "只跑着 $running 个容器，补一次 up -d"
+    docker compose up -d --remove-orphans
+  fi
+else
+  # 必须 --force-recreate：mediamtx.yml / nginx.conf 都是 bind mount，
+  # 而 MediaMTX **只在启动时读配置**、nginx 也只在启动时读挂载进来的那份。
+  # 不重建容器的话新配置根本不生效（日志时间戳会出卖你）。和 frpc 是同一个坑。
+  docker compose up -d --force-recreate --remove-orphans
+fi
 
 log "4/5 自检"
 ok=0

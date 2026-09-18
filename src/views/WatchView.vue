@@ -11,20 +11,19 @@
  * 只有在服务端返回 401（受控模式）时才会退回「需要令牌」的门禁；
  * 默认的开放模式下观众永远看不到它。
  *
- * 布局是「顶栏 / 分享条 / 舞台 / 控制栏」四段，全部纯色块，没有任何浮动元素和投影。
+ * 布局是「顶栏 / 舞台 / 控制栏」三段，全部纯色块，没有任何浮动元素和投影。
  * 所有会出错的地方都在舞台中央给出一个整块的说明态，而不是弹窗或 toast。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import ControlBar from '@/components/ControlBar.vue'
-import CopyField from '@/components/CopyField.vue'
 import Icon from '@/components/Icon.vue'
 import JoinGate from '@/components/JoinGate.vue'
 import SoundPrompt from '@/components/SoundPrompt.vue'
 import StatsPanel from '@/components/StatsPanel.vue'
 import StatusChip from '@/components/StatusChip.vue'
 import { usePlayer } from '@/composables/usePlayer'
-import { buildWatchUrl, FIXED_ROOM, readToken, type Session } from '@/lib/config'
+import { FIXED_ROOM, readToken, type Session } from '@/lib/config'
 
 // 房间号是构建时常量；令牌默认是空串（开放模式），只有受控模式才从地址栏带进来
 const session = reactive<Session>({ room: FIXED_ROOM, token: readToken() })
@@ -55,8 +54,6 @@ const pipSupported = ref(false)
 const controlsVisible = ref(true)
 
 const isPlaying = computed(() => phase.value === 'playing')
-/** 短链接，不带令牌；受控模式下（地址栏里本来就有 ?k=）才跟着带上令牌 */
-const shareUrl = computed(() => buildWatchUrl(session.token))
 /** 服务端用 404 表示「房间里没有流」，也用来表示「房间路径不对」—— 后者是配置问题 */
 const looksLikeMissingPath = computed(() => waitReason.value.includes('404'))
 
@@ -318,11 +315,6 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <!-- 分享条：短链接，拿到就能看。链接文本永远摊在页面上，可选中、可读 -->
-    <div class="sharebar">
-      <CopyField label="观看链接" :value="shareUrl" />
-    </div>
-
     <div
       ref="stageRef"
       class="stage"
@@ -482,14 +474,6 @@ onBeforeUnmount(() => {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
-}
-
-/* ---- 分享条 ---- */
-.sharebar {
-  flex: none;
-  padding: var(--sp-2) var(--sp-4);
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
 }
 
 /* ---- 舞台 ---- */

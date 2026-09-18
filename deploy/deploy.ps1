@@ -209,6 +209,24 @@ Write-Step '3/6 推送到 tencent'
 # 之后 docker compose 才能以普通用户身份跑。
 Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "sudo mkdir -p $remoteDir/data && sudo chown -R polarbear:polarbear $remoteDir") -What 'ssh 建目录'
 
+# 配置有没有变？没变就不用重建容器 —— 重建会打断正在推的 OBS 流。
+# 比对渲染结果的 md5 和主机上那份，一致且容器在跑，就走 --no-recreate。
+$localHashes = @{}
+foreach ($f in @($mediamtxOut, $nginxOut)) { $localHashes[(Split-Path $f -Leaf)] = (Get-FileHash -LiteralPath $f -Algorithm MD5).Hash }
+$remoteHashText = (& ssh $HostAlias "md5sum $remoteDir/mediamtx.yml $remoteDir/nginx.conf 2>/dev/null || true") -join "`n"
+$remoteHashes = @{}
+foreach ($line in ($remoteHashText -split "`n")) {
+    if ($line -match '^\s*([0-9a-f]{32})\s+(\S+)$') { $remoteHashes[(Split-Path $Matches[2] -Leaf)] = $Matches[1].ToUpper() }
+}
+$runningContainers = ((& ssh $HostAlias "docker ps --format '{{.Names}}' | grep -c '^screen-share-'" 2>$null) -join '').Trim()
+$configUnchanged = $true
+foreach ($name in $localHashes.Keys) {
+    if (-not $remoteHashes.ContainsKey($name) -or $remoteHashes[$name] -ne $localHashes[$name]) { $configUnchanged = $false }
+}
+$noRecreate = $configUnchanged -and ($runningContainers -eq '2')
+if ($noRecreate) { Write-Ok '容器配置没变 → 这次不重建容器（不会打断推流）' }
+else { Write-Ok "容器配置有变（或容器没在跑）→ 会重建容器" }
+
 # scp 会把 "E:\..." 当成「主机 E + 路径 \...」，所以一律用相对路径推
 Push-Location $root
 try {
@@ -219,10 +237,12 @@ try {
     Invoke-Checked -Command 'scp' -Arguments @('-q', 'deploy/remote-install.sh', "${HostAlias}:$remoteDir/") -What 'scp remote-install.sh'
     Write-Ok '配置已推送'
 
-    # 前端产物整目录替换，避免旧 hash 文件堆在服务器上
+    # 前端产物**原地替换**（find -delete + cp -a），不再 rm -rf 整个目录：
+    # 目录 inode 一变，容器里那份 bind mount 就指向被删掉的旧目录，页面直接 404。
+    # 原地替换后容器不用重建也能立刻拿到新产物。
     Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "rm -rf $remoteDir/www.new") -What 'ssh 清理旧产物'
     Invoke-Checked -Command 'scp' -Arguments @('-q', '-r', 'www', "${HostAlias}:$remoteDir/www.new") -What 'scp www'
-    Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "rm -rf $remoteDir/www && mv $remoteDir/www.new $remoteDir/www") -What 'ssh 切换产物'
+    Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "find $remoteDir/www -mindepth 1 -delete && cp -a $remoteDir/www.new/. $remoteDir/www/ && rm -rf $remoteDir/www.new") -What 'ssh 原地替换产物'
     Write-Ok '前端产物已替换'
 } finally {
     Pop-Location
@@ -232,6 +252,7 @@ try {
 
 Write-Step '4/6 远端安装并启动'
 $installArgs = "$remoteDir/remote-install.sh $($config['MTX_API_PORT']) $($config['PUBLIC_PORT']) $($config['PUBLIC_HOST']) $($config['MTX_WEBRTC_UDP_PORT'])"
+if ($noRecreate) { $installArgs += ' --no-recreate' }
 Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "bash $installArgs") -What '远端安装'
 
 # ------------------------------------------------------------------ 6. 汇总

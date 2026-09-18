@@ -218,6 +218,26 @@ async function main() {
       : `受控模式（VIEW_TOKEN 有值）→ 观看请求带 ?k=${config.viewToken.slice(0, 4)}…`,
   )
 
+  // ---- 别把正在直播的那一路顶下线 ----
+  //
+  // MediaMTX 的 overridePublisher 默认是 true：谁后推谁说了算，合成推流一起，
+  // 正在推的 OBS 会被**顶掉**（实测踩过：OBS 要 2 秒左右才自动重连回来，观众会断一下）。
+  // 所以发现房间里已经有流就直接拒绝跑，要跑得显式 --force。
+  if (!args.flags.force) {
+    const liveProbe = await fetch(withToken(`${config.base}/hls/${config.room}/index.m3u8`, config.viewToken), {
+      method: 'GET',
+    }).catch(() => null)
+    if (liveProbe?.status === 200) {
+      report.record('没有正在直播的推流', false, `${config.base}/hls/${config.room}/index.m3u8 → 200，房间里有流`)
+      report.note('现在跑会把正在推的 OBS 顶下线（overridePublisher=true），所以先不跑。')
+      report.note('要停掉直播再跑，或者确认可以顶掉时加 --force。')
+      return report.summary()
+    }
+    report.record('没有正在直播的推流', true, `房间空着（HLS 播放列表 ${liveProbe?.status ?? '连不上'}），可以安全地起合成推流`)
+  } else {
+    report.record('没有正在直播的推流', true, '--force：跳过检查，合成推流会把现有推流顶掉')
+  }
+
   // 总超时看门狗：宁可自己了断，也不要挂死
   const clearWatchdog = installWatchdog(watchdogMs, '验收')
 
@@ -650,9 +670,12 @@ async function main() {
   }
 }
 
+// 只设 exitCode，**不要** process.exit()：fetch（undici）的长连接还没关干净就被硬退，
+// 在 Windows 上会撞 libuv 的 `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`，
+// 退出一堆红字，看着像脚本自己崩了。让 Node 自然收尾即可。
 try {
-  process.exit(await main())
+  process.exitCode = await main()
 } catch (error) {
   reportFatal(error)
-  process.exit(1)
+  process.exitCode = 1
 }
