@@ -6,9 +6,12 @@
  *
  * 和这套部署（nginx 反代 + MediaMTX，全链路明文 http）的契约：
  *
- *   POST   <origin>/whep/<房间>?k=<令牌>   Content-Type: application/sdp
- *   PATCH  <Location>                      Content-Type: application/trickle-ice-sdpfrag
+ *   POST   <origin>/whep/<房间>[?k=<令牌>]   Content-Type: application/sdp
+ *   PATCH  <Location>                        Content-Type: application/trickle-ice-sdpfrag
  *   DELETE <Location>
+ *
+ * 令牌是可选的：默认（开放模式）请求上不带任何 query，
+ * 只有页面 URL 里带了 ?k=（受控模式）才透传上去。
  *
  * <Location> 是服务器用 Location 头回来的地址。MediaMTX 给的是**相对路径**
  * （/r-<房间>/whep/<会话>），nginx 用 proxy_redirect 把它改写成
@@ -16,7 +19,7 @@
  * 千万不要自己再拼一次 ?k=，令牌拼两遍会被 nginx 那条 401 拦掉，
  * 会话就得等 ICE 超时（约 30 秒）才从服务端消失。
  */
-import { origin } from '@/lib/config'
+import { origin, withToken } from '@/lib/config'
 
 /** WHEP 请求失败。status 是服务端 HTTP 状态码，纯网络失败时为 0。 */
 export class WhepError extends Error {
@@ -224,15 +227,12 @@ export async function startWhep(options: WhepOptions): Promise<WhepSession> {
 
     let response: Response
     try {
-      response = await fetch(
-        `${origin()}/whep/${options.room}?k=${encodeURIComponent(options.token)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/sdp', Accept: 'application/sdp' },
-          body: pc.localDescription?.sdp ?? '',
-          signal: controller.signal,
-        },
-      )
+      response = await fetch(withToken(`${origin()}/whep/${options.room}`, options.token), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp', Accept: 'application/sdp' },
+        body: pc.localDescription?.sdp ?? '',
+        signal: controller.signal,
+      })
     } catch (error) {
       // AbortError 是超时，不是用户取消；说清楚免得以为是「被点了取消」
       if ((error as Error)?.name === 'AbortError') {

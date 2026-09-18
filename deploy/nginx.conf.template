@@ -10,10 +10,15 @@
 #     所以不做自签 HTTPS —— OBS 的 WHIP 本来就支持 http://，浏览器侧拉流
 #     （WHEP/HLS）也验证过不要求安全上下文。代价见 README。
 #
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/?k=<观看令牌>        观看页
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whep/__ROOM__?k=...  浏览器拉流（主路径，<1s）
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/__VIEW_PATH__        观看页（打开就能看）
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whep/__ROOM__        浏览器拉流（主路径，<1s）
 #   http://__PUBLIC_HOST__:__PUBLIC_PORT__/hls/__ROOM__/...     LL-HLS 兜底（2-4s）
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whip/__ROOM__?k=...  OBS 推流
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whip/__ROOM__?k=...  OBS 推流（这条带令牌）
+#
+# 观看侧**不校验令牌**（`VIEW_TOKEN` 留空时的行为）：链接要能口头念、能手打，
+# 所以只有推流侧保留令牌 —— 那个不能公开，否则别人能顶掉你的推流。
+# 想收回观看权限：把 .env 的 VIEW_PATH 改成一串随机字符重跑部署；
+# 或者把 VIEW_TOKEN 填上随机值，这时观看请求必须带 ?k=（模板会渲染出校验）。
 #
 # 上游全在 127.0.0.1，而 MediaMTX 只信任本机请求，所以这里是唯一入口。
 #
@@ -49,15 +54,29 @@ server {
         add_header Cache-Control "public, immutable";
     }
 
-    # 入口 HTML 绝不能缓存，否则发版后用户一直拿到旧壳子
-    location = /index.html {
+    # 观看页只认这一条路径（容忍结尾多一个斜杠：手打地址时很容易带上）。
+    #
+    # 为什么不让 `location /` 也 try_files 到 index.html：那样**任何**路径都能出应用页，
+    # 于是「换个 VIEW_PATH 就等于收回链接」这句话就不成立了（旧路径照样能打开）。
+    # 现在 /screen 才是入口，别的路径 404，路径至少能挡住随手扫描的人。
+    # 真要有访问控制，把 .env 的 VIEW_TOKEN 填上（受控模式）。
+    location ~ "^/__VIEW_PATH__/?$" {
+        try_files /index.html =404;
         add_header Cache-Control "no-store, must-revalidate";
     }
 
-    # SPA：/ 回 index.html
+    # 手打 IP:端口进来顺手跳到观看页（少记一段路径）
+    location = / {
+        return 302 /__VIEW_PATH__;
+    }
+
+    # 别让人用 /index.html 绕过上面那条
+    location = /index.html {
+        return 404;
+    }
+
     location / {
-        try_files $uri /index.html;
-        add_header Cache-Control "no-store, must-revalidate";
+        return 404;
     }
 
     # ---- WHEP：观众拉流（POST 建会话 / PATCH 补候选 / DELETE 结束）----
@@ -68,8 +87,7 @@ server {
     # 正则一律加引号：里面写了 [^?]* 这样的字符类，而 nginx 会把裸的 { 当成块起始符，
     # 于是正则在那个位置被截断，报 "pcre_compile() failed: missing )"。
     location ~ "^/whep/__ROOM__(/[^?]*)?$" {
-        if ($arg_k != "__VIEW_TOKEN__") { return 401; }
-
+__WHEP_VIEW_GUARD__
         # 改写成本机 MediaMTX 的路径。用 rewrite+break、proxy_pass 不带 URI，
         # 避免 nginx 在运行时解析上游地址。
         #
@@ -88,8 +106,8 @@ server {
         # 不改写的话，浏览器会把后续 PATCH/DELETE 发到 /r-<房间>/whep/... 上去 ——
         # 那个路径不匹配本 location，直接落到静态文件里变成 404。
         # 正则里显式吃掉可能存在的 query（([^?]*)(\?.*)?），只保留路径部分，免得令牌拼两遍。
-        proxy_redirect ~^https?://[^/]+/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2?k=__VIEW_TOKEN__;
-        proxy_redirect ~^/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2?k=__VIEW_TOKEN__;
+        proxy_redirect ~^https?://[^/]+/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2__VIEW_TOKEN_QS__;
+        proxy_redirect ~^/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2__VIEW_TOKEN_QS__;
     }
 
     # ---- WHIP：OBS 推流 ----
@@ -113,16 +131,11 @@ server {
 
     # ---- LL-HLS：兜底观看 ----
     #
-    # hls.js 请求分片时**不会**把播放列表上的 query 带过去，所以令牌走 cookie：
-    # 第一个带 ?k= 的请求种下 cookie，后面的分片靠 cookie 通过。
+    # hls.js 请求分片时**不会**把播放列表上的 query 带过去，所以这里不靠客户端带令牌
+    # （开放模式下压根没有令牌）。要受控就把 .env 的 VIEW_TOKEN 填上，
+    # 那时模板会渲染出「cookie 换令牌」那段守卫。
     location ~ "^/hls/__ROOM__/(.+)$" {
-        set $sc_ok 0;
-        if ($arg_k = "__VIEW_TOKEN__")     { set $sc_ok 1; }
-        if ($cookie_sc_k = "__VIEW_TOKEN__") { set $sc_ok 1; }
-        if ($sc_ok = 0) { return 401; }
-
-        add_header Set-Cookie "sc_k=__VIEW_TOKEN__; Path=/; Max-Age=43200; SameSite=Lax" always;
-
+__HLS_VIEW_GUARD__
         # 把 query 整个换成固定的 cookieCheck=1，**但必须把 session 留下来**。
         #
         # 注意**不能**写成 rewrite 替换串里带 ?cookieCheck=1：nginx 的 rewrite 在替换串

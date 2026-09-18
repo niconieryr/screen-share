@@ -27,12 +27,14 @@ import {
   probeHls,
   readReceivedStats,
   readSenderStats,
+  readableError,
   reportFatal,
   resolveConfig,
   sdpCodecs,
   startSyntheticPublisher,
   stopSyntheticPublisher,
   waitForStreamReady,
+  withToken,
 } from './lib/harness.mjs'
 
 const USAGE = `
@@ -44,28 +46,39 @@ screen-share 端到端验收
 选项：
   --base=<url>            对外地址（默认 http://43.142.33.45:8443）
   --room=<名字>           房间号（默认 share01，nginx 里是固化的）
+  --view-path=<路径>      观看短链接的路径段（默认 screen，即 /screen）
   --view-token=<令牌>     观看令牌（默认取环境变量 VIEW_TOKEN，再取 .env 的 VIEW_TOKEN）
+                          留空 = 开放模式：/screen 谁都能看，观看请求不带 ?k=（默认形态）
+                          有值 = 受控模式：观看请求会带上 ?k=
   --publish-token=<令牌>  推流令牌（默认取环境变量 PUBLISH_TOKEN，再取 .env 的 PUBLISH_TOKEN）
   --canvas=1920x1080      合成推流的画布尺寸（默认 1280x720）
   --hls-timeout=<秒>      HLS 降级出画的超时上限（默认 60，超时即失败）
   --timeout=<秒>          整个脚本的总超时（默认 300）
   --help                  看这段
 
-验收项：WHIP 建流 / WHEP 出画 / 音轨是 Opus / WHEP DELETE / 降级 HLS / 错误令牌 401 /
-        零转码（分辨率与编码一致）/ 房间名写错 404
+验收项：短链接 /screen 可用 / 根路径同一页 / WHIP 建流 / 不带令牌就能拉流（开放模式）/
+        WHEP 出画 / 音轨是 Opus / WHEP DELETE / 零转码（分辨率与编码一致）/
+        观众页免点击出画且默认静音 / HLS 三级探针 / 拦掉 WHEP 自动降级 HLS /
+        推流令牌错或缺失 → 401 / 房间名写错 → 404
 `
 
 // ------------------------------------------------------------------ 小工具
 
-/** 打开观众页并尽量让它开始播。设计上可能有个「进入房间」门禁，有就点，没有就往下走。 */
-async function openWatchPage(browser, config, { blockWhep = false } = {}) {
+/**
+ * 打开观众页。**一个字都不点** —— 新交互要求短链接点进去就该静音自动播放，
+ * 任何点击（门禁、播放按钮）都算它没做到。
+ * blockWhep 用来模拟「观众网络把 WebRTC 全掐了」，验证自动降级 HLS。
+ */
+async function openWatchPage(browser, config, { blockWhep = false, url } = {}) {
   const page = await browser.newPage({ viewport: { width: 960, height: 600 } })
   page.setDefaultTimeout(config.pageTimeoutMs)
   page.setDefaultNavigationTimeout(config.pageTimeoutMs)
 
-  const seen = { hls: [], bad: [] }
+  const seen = { hls: [], bad: [], whep: [] }
   page.on('request', (request) => {
-    if (request.url().includes('/hls/') && request.url().includes('.m3u8')) seen.hls.push(request.url())
+    const target = request.url()
+    if (target.includes('/hls/') && target.includes('.m3u8')) seen.hls.push(target)
+    if (target.includes('/whep/')) seen.whep.push(target)
   })
   page.on('response', (response) => {
     if (response.status() >= 400) seen.bad.push(`${response.status()} ${response.request().method()} ${response.url()}`)
@@ -77,26 +90,30 @@ async function openWatchPage(browser, config, { blockWhep = false } = {}) {
     await page.route('**/whep/**', (route) => route.abort())
   }
 
-  await page.goto(`${config.base}/?k=${encodeURIComponent(config.viewToken)}`, {
-    waitUntil: 'domcontentloaded',
-  })
-
-  // 有门禁按钮就点（旧项目是这样）；新页面直接带 ?k= 自动播，那就点不到，属正常
-  await page
-    .getByRole('button', { name: /进入房间|进入观看|开始观看/ })
-    .first()
-    .click({ timeout: 3000 })
-    .catch(() => undefined)
-
-  // 自动播放策略：带声音的自动播放可能被拦，主动 play() 一下。
-  // 注意这不影响断言 —— 断言要的是 videoWidth > 0（真有画面），不是 paused。
-  await page
-    .evaluate(() => {
-      const video = document.querySelector('video')
-      video?.play?.().catch(() => undefined)
-    })
-    .catch(() => undefined)
+  // 注意：全局 launch 参数里放开了自动播放策略，避免把「浏览器策略」误判成
+  // 「页面实现问题」。所以页面必须自己做到静音自动播放 —— 下面单独断言 video.muted。
+  await page.goto(url ?? config.viewerURL, { waitUntil: 'domcontentloaded' })
   return { page, seen }
+}
+
+/**
+ * 尽早抓住 <video> 的**初始**状态：muted 必须在页面自己播放之前就是 true，
+ * 晚一点读可能已经被页面的其它逻辑改掉了。
+ */
+async function waitForInitialVideo(page, timeoutMs = 20000) {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    const state = await page
+      .evaluate(() => {
+        const video = document.querySelector('video')
+        if (!video) return null
+        return { muted: video.muted, autoplay: video.autoplay, paused: video.paused, playsInline: video.playsInline }
+      })
+      .catch(() => null)
+    if (state) return state
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  return null
 }
 
 /** 等画面真的出来：videoWidth > 0 才算，currentTime 在走不算（能只有声音没画面）。 */
@@ -115,7 +132,7 @@ async function waitForPicture(page, timeoutMs) {
       .evaluate(() => {
         const video = document.querySelector('video')
         if (!video) return '页面上没有 <video> 元素'
-        return `videoWidth=${video.videoWidth} readyState=${video.readyState} paused=${video.paused} currentTime=${video.currentTime.toFixed(2)}`
+        return `videoWidth=${video.videoWidth} readyState=${video.readyState} paused=${video.paused} currentTime=${video.currentTime.toFixed(2)} source=${video.srcObject ? 'MediaStream' : video.currentSrc || '(空)'}`
       })
       .catch(() => '页面都读不到了')
     return { ok: false, seconds: (Date.now() - started) / 1000, observed }
@@ -128,15 +145,26 @@ async function readPlayback(page) {
     .evaluate(() => {
       const video = document.querySelector('video')
       if (!video) return null
+      const controls = [...document.querySelectorAll('button,[role="button"],a')]
+      const label = (element) =>
+        `${element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''} ${element.getAttribute('title') ?? ''}`.trim()
+      // 开声按钮：文案/无障碍标签里带「声音 / 静音 / 取消静音 / unmute」之类
+      const unmute = controls.find((element) => /声音|静音|开声|取消静音|unmute|unmuted|volume|speaker/i.test(label(element)))
       return {
         width: video.videoWidth,
         height: video.videoHeight,
         paused: video.paused,
         muted: video.muted,
         audioTracks: video.srcObject?.getAudioTracks?.().length ?? 0,
+        unmuteControl: unmute ? label(unmute).replace(/\s+/g, ' ').slice(0, 24) : null,
       }
     })
     .catch(() => null)
+}
+
+/** 页面是不是「应用页面」而不是占位页：有 module 脚本或引用了构建产物 */
+function looksLikeApp(html) {
+  return /<script[^>]+type=["']module["']/i.test(html) || /(?:src|href)=["'][^"']*assets\//i.test(html)
 }
 
 // ------------------------------------------------------------------ 主流程
@@ -148,7 +176,8 @@ async function main() {
     return 0
   }
 
-  const config = resolveConfig(args, { need: ['viewToken', 'publishToken'] })
+  // 观看令牌现在是**可选**的（空 = 开放模式），所以 need 里只要推流令牌
+  const config = resolveConfig(args, { need: ['publishToken'] })
   const [canvasWidth, canvasHeight] = String(args.flags.canvas ?? '1280x720')
     .split('x')
     .map((value) => Number.parseInt(value, 10))
@@ -160,7 +189,8 @@ async function main() {
   console.log('screen-share 端到端验收（明文 http，无域名无证书）')
   report.info(`目标     ${config.base}（来自 ${config.baseFrom}）`)
   report.info(`房间     ${config.room}（来自 ${config.roomFrom}）`)
-  report.info(`观看令牌 ${config.viewToken ? '已配置' : '缺失'}（来自 ${config.viewTokenFrom}）`)
+  report.info(`观看入口 ${config.viewerURL}（路径来自 ${config.viewPathFrom}）`)
+  report.info(`观看令牌 ${config.viewToken ? `已配置（${config.viewTokenFrom}）→ 受控模式` : `为空（${config.viewTokenFrom}）→ 开放模式`}`)
   report.info(`推流令牌 ${config.publishToken ? '已配置' : '缺失'}（来自 ${config.publishTokenFrom}）`)
 
   // ---------------------------------------------------------------- 前置：探活
@@ -175,13 +205,18 @@ async function main() {
   }
   report.record('目标可达', true, `${config.base} → HTTP ${reach.status}（${reach.ms}ms）`)
 
-  if (!config.viewToken || !config.publishToken) {
-    const missing = [!config.viewToken && '观看令牌', !config.publishToken && '推流令牌'].filter(Boolean)
-    report.record('令牌齐备', false, `缺 ${missing.join(' 和 ')}`)
-    report.note('用 --view-token=… / --publish-token=… 传，或设同名环境变量，或在项目根目录的 .env 里写')
-    report.note('VIEW_TOKEN=… / PUBLISH_TOKEN=…（.env 现在可能还不存在）。')
+  if (!config.publishToken) {
+    report.record('推流令牌齐备', false, '推流令牌是必填的 —— 少了它连合成推流都建不起来')
+    report.note('用 --publish-token=… 传，或设环境变量 PUBLISH_TOKEN，或在项目根目录 .env 里写 PUBLISH_TOKEN=…。')
     return report.summary()
   }
+  report.record(
+    '观看端模式',
+    true,
+    config.openMode
+      ? `开放模式（VIEW_TOKEN 为空）→ ${config.viewerURL} 谁都能看，观看请求不带 ?k=`
+      : `受控模式（VIEW_TOKEN 有值）→ 观看请求带 ?k=${config.viewToken.slice(0, 4)}…`,
+  )
 
   // 总超时看门狗：宁可自己了断，也不要挂死
   const clearWatchdog = installWatchdog(watchdogMs, '验收')
@@ -192,7 +227,49 @@ async function main() {
   let fallback = null
 
   try {
-    report.section('1. 合成一路 WHIP 推流（canvas + 振荡器，H.264 + Opus）')
+    // ---------------------------------------------------------------- 短链接
+    report.section('1. 观看短链接（公开访问）')
+
+    // 短链接：**跟随重定向**再判。`/screen` 本身 200 最好；302 到某个同样是应用页的
+    // 地址也照样算「点进去就能看」—— 我们要的是结果，不是某一种实现。
+    const fetchPage = async (path) => {
+      try {
+        const response = await fetch(`${config.base}${path}`, { signal: AbortSignal.timeout(15000) })
+        return {
+          status: response.status,
+          html: await response.text().catch(() => ''),
+          finalUrl: response.url,
+          redirected: response.redirected,
+        }
+      } catch (error) {
+        return { status: -1, html: '', finalUrl: '', redirected: false, error: error?.message ?? String(error) }
+      }
+    }
+    const describePage = (page, path) =>
+      page.status !== 200
+        ? `HTTP ${page.status}${page.error ? `（${page.error}）` : ''}`
+        : looksLikeApp(page.html)
+          ? `HTTP 200（${path}${page.redirected ? ` → ${page.finalUrl}` : ''}，${page.html.length} 字节应用页面）`
+          : `HTTP 200 但拿到的不是应用页面（没有 module 脚本也没有 assets/ 引用）：${page.html.replace(/\s+/g, ' ').slice(0, 120)}`
+
+    const shortLink = await fetchPage(`/${config.viewPath}`)
+    report.record(
+      `GET /${config.viewPath} → 200 且是应用页面`,
+      shortLink.status === 200 && looksLikeApp(shortLink.html) && shortLink.finalUrl.startsWith(config.base),
+      describePage(shortLink, `/${config.viewPath}`),
+    )
+
+    // `/` 也仍然应该出同一页（短链接只是更好看，不是唯一入口）。
+    // 实测部署里 `/` 是 302 → /screen，所以这里跟随重定向判最终结果。
+    const rootPage = await fetchPage('/')
+    report.record(
+      'GET / 也出同一页（短链接不是唯一入口）',
+      rootPage.status === 200 && looksLikeApp(rootPage.html) && rootPage.finalUrl.startsWith(config.base),
+      describePage(rootPage, '/'),
+    )
+
+    // ---------------------------------------------------------------- 推流
+    report.section('2. 合成一路 WHIP 推流（canvas + 振荡器，H.264 + Opus）')
     const launched = await launchBrowser()
     browser = launched.browser
     report.info(`浏览器   ${launched.used}`)
@@ -215,7 +292,7 @@ async function main() {
       )
     } catch (error) {
       // 推流建不起来，后面全都没意义，直接收摊
-      report.record('WHIP 推流建立成功（PeerConnection connected）', false, error?.message ?? String(error))
+      report.record('WHIP 推流建立成功（PeerConnection connected）', false, readableError(error))
       report.note('推流是后面所有断言的前提，先把它弄通。OBS 侧的对照设置见 docs/OBS-设置.md。')
       return report.summary()
     }
@@ -228,10 +305,10 @@ async function main() {
       token: config.viewToken,
     })
     report.record(
-      '服务端已就绪（WHEP 能建会话）',
+      config.openMode ? '不带任何令牌也能建 WHEP 会话（开放模式）' : '服务端已就绪（WHEP 能建会话）',
       ready.ok,
       ready.ok
-        ? `${ready.attempts} 次探测后成功，耗时 ${ready.seconds.toFixed(1)} 秒`
+        ? `${ready.attempts} 次探测后成功，耗时 ${ready.seconds.toFixed(1)} 秒（请求${config.openMode ? '不带 ?k=' : '带 ?k='}）`
         : `${ready.seconds.toFixed(1)} 秒内 ${ready.attempts} 次探测都失败，最后一次 HTTP ${ready.status} ${ready.body}`,
     )
     if (!ready.ok) {
@@ -240,7 +317,7 @@ async function main() {
     }
 
     // ---------------------------------------------------------------- WHEP
-    report.section('2. WHEP 主路径（裸会话读接收侧统计）')
+    report.section('3. WHEP 主路径（裸会话读接收侧统计）')
 
     const sender = await readSenderStats(publisher, { waitMs: 1500 })
     const senderVideo = sender.outbound.find((item) => item.kind === 'video') ?? null
@@ -248,13 +325,24 @@ async function main() {
 
     // 这一路接了个自建 <video>：既证「服务端真的在发」，也证「浏览器真能解出画面」，
     // 和前端页面写得怎么样无关。位置：见 harness 的 attachVideo。
-    const received = await readReceivedStats(publisher, {
-      base: config.base,
-      room: config.room,
-      token: config.viewToken,
-      waitMs: 6000,
-      attachVideo: true,
-    })
+    let received
+    try {
+      received = await readReceivedStats(publisher, {
+        base: config.base,
+        room: config.room,
+        token: config.viewToken,
+        waitMs: 6000,
+        attachVideo: true,
+      })
+    } catch (error) {
+      report.record(
+        config.openMode ? '开放模式：不带令牌的 WHEP 会话也能建起来' : 'WHEP 会话能建起来',
+        false,
+        readableError(error),
+      )
+      report.note('这一路是后面所有观看侧断言的前提，先把它弄通。')
+      return report.summary()
+    }
     const audioIn = received.inbound.find((item) => item.kind === 'audio') ?? null
     const videoIn = received.inbound.find((item) => item.kind === 'video') ?? null
 
@@ -293,7 +381,7 @@ async function main() {
     // ---------------------------------------------------------------- Location / DELETE
     const location = inspectWhepLocation(config.base, config.room, received.location, config.viewToken)
     report.record(
-      'WHEP 的 Location 指回对外地址且带令牌',
+      config.openMode ? 'WHEP 的 Location 指回对外地址（开放模式不带令牌）' : 'WHEP 的 Location 指回对外地址且带令牌',
       location.ok,
       location.ok ? location.url : `${location.url ?? '(没有 Location)'} —— ${location.why}`,
     )
@@ -324,7 +412,7 @@ async function main() {
     )
 
     // ---------------------------------------------------------------- 零转码
-    report.section('3. 服务端零转码（推流与收看一致）')
+    report.section('4. 服务端零转码（推流与收看一致）')
 
     const sameSize =
       !!senderVideo &&
@@ -349,26 +437,44 @@ async function main() {
     )
 
     // ---------------------------------------------------------------- 观看页
-    report.section('4. 观看页出画面（前端实现）')
+    report.section('5. 观众页：短链接点进去就出画（一次都不点）')
 
     // 上面那路是自建 <video>，证明的是链路；这一路走真实观众页，
-    // 证明的是「页面自己会拉流并渲染」。两者分开，出问题时一眼能分清是谁的锅。
+    // 证明的是「页面自己会拉流、自己静音自动播放」。两者分开，出问题时一眼能分清是谁的锅。
     const watch = await openWatchPage(browser, config)
     viewer = watch.page
+
+    // 先抓 <video> 一出现时的 muted —— 这是「静音自动播放」的直接证据，
+    // 等出画之后再读可能已经被页面自己的逻辑改掉了。
+    const initial = await waitForInitialVideo(viewer, 20000)
+    if (!initial) {
+      report.record('观众页有 <video> 元素', false, '20 秒内页面上都没出现 <video>')
+    }
     const picture = await waitForPicture(viewer, 30000)
     report.record(
-      '观众页出画面（videoWidth > 0，不是只有 currentTime 在走）',
+      config.openMode ? `直接打开 /${config.viewPath}（不带 query）就出画，全程没点任何东西` : '观众页出画（全程没点任何东西）',
       picture.ok,
-      picture.ok ? `耗时 ${picture.seconds.toFixed(1)} 秒` : `30 秒内没出画：${picture.observed}`,
+      picture.ok ? `耗时 ${picture.seconds.toFixed(1)} 秒（URL：${config.viewerURL}）` : `30 秒内没出画：${picture.observed}`,
     )
-    if (picture.ok) {
-      const shown = await readPlayback(viewer)
-      if (shown) {
-        report.note(
-          `页面 video：${shown.width}×${shown.height}，paused=${shown.paused}，muted=${shown.muted}，音轨 ${shown.audioTracks} 条`,
-        )
-      }
+    report.record(
+      '页面默认静音（不然浏览器不给自动播放）',
+      !!initial && initial.muted === true,
+      initial ? `video.muted=${initial.muted}，autoplay=${initial.autoplay}，playsInline=${initial.playsInline}` : '没读到 <video>',
+    )
+
+    const shown = picture.ok ? await readPlayback(viewer) : null
+    if (shown) {
+      report.note(
+        `页面 video：${shown.width}×${shown.height}，paused=${shown.paused}，muted=${shown.muted}，音轨 ${shown.audioTracks} 条`,
+      )
     }
+    // 开声按钮是给观众自己点的那一下（浏览器要求有用户手势才能出声），顺带看一眼在不在
+    report.record(
+      '页面上有开声控件（观众自己点一下才有声音）',
+      !!shown?.unmuteControl,
+      shown?.unmuteControl ? `找到控件：「${shown.unmuteControl}」` : '没找到文案/aria-label 里带「声音/静音/开声/unmute」的按钮或链接',
+    )
+
     const badOnWatchPage = watch.seen.bad.filter((line) => !line.includes('/whep/'))
     report.record(
       '观看页没有意料之外的失败请求',
@@ -377,7 +483,7 @@ async function main() {
     )
 
     // ---------------------------------------------------------------- HLS 直连探针
-    report.section('5. HLS 兜底链路（直连探针，走完整三级）')
+    report.section('6. HLS 兜底链路（直连探针，走完整三级）')
 
     const hls = await probeHls(config.base, config.room, config.viewToken)
     report.record(
@@ -396,7 +502,7 @@ async function main() {
         : `master 里没解析出变体地址（找到 ${hls.variants} 个候选）`,
     )
     report.record(
-      'HLS 分片能取到（不带 ?k=，靠服务端种的 cookie）',
+      'HLS 分片能取到（不带 ?k=，cookie 只用于 MediaMTX 自己的 cookieCheck/session）',
       hls.segment.status === 200,
       hls.segment.url
         ? `HTTP ${hls.segment.status}（${hls.segment.url}；cookie：[${hls.cookies.join(', ') || '无'}]）`
@@ -405,7 +511,7 @@ async function main() {
     if (hls.trace.length > 1) report.note(`请求轨迹：${hls.trace.join(' → ')}`)
 
     // ---------------------------------------------------------------- 降级
-    report.section('6. WHEP 走不通时自动降级 HLS')
+    report.section('7. WHEP 走不通时自动降级 HLS')
 
     const blocked = await openWatchPage(browser, config, { blockWhep: true })
     fallback = blocked.page
@@ -413,7 +519,7 @@ async function main() {
     const fallbackPicture = await waitForPicture(fallback, hlsTimeoutMs)
     const fallbackSeconds = (Date.now() - fallbackStarted) / 1000
     report.record(
-      '拦掉 WHEP 后仍能出画（超时算失败）',
+      '拦掉 WHEP 后仍能出画（超时算失败，全程不点击）',
       fallbackPicture.ok,
       fallbackPicture.ok
         ? `耗时 ${fallbackSeconds.toFixed(1)} 秒（上限 ${hlsTimeoutMs / 1000} 秒）`
@@ -439,20 +545,53 @@ async function main() {
     report.record('HLS 画面在持续推进', advanced > 0.5, `3 秒内推进了 ${advanced.toFixed(2)} 秒`)
 
     // ---------------------------------------------------------------- 鉴权
-    report.section('7. 鉴权与房间路由')
+    report.section('8. 鉴权与房间路由')
 
-    const badView = await fetch(`${config.base}/whep/${config.room}?k=nope-nope-nope`, {
+    // 观看端现在是短链接公开访问：裸 POST（不带任何令牌）**不该**被 401。
+    // 注意这里塞的是假 SDP（v=0），所以 400 之类的「内容不合法」是正常的 ——
+    // 要的是「不是鉴权拒绝」。
+    const anonView = await fetch(`${config.base}/whep/${config.room}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/sdp' },
       body: 'v=0',
       signal: AbortSignal.timeout(10000),
     }).catch((error) => ({ status: `连不上（${error.message}）` }))
-    report.record(
-      '错误观看令牌被拒（401/403）',
-      badView.status === 401 || badView.status === 403,
-      `POST /whep/${config.room}?k=nope… → HTTP ${badView.status}`,
-    )
+    if (config.openMode) {
+      report.record(
+        '开放模式：不带任何令牌也不被拒（不是 401）',
+        typeof anonView.status === 'number' && anonView.status !== 401 && anonView.status !== 403,
+        `POST /whep/${config.room}（无 ?k=）→ HTTP ${anonView.status}（假 SDP，非 401 即算通过）`,
+      )
+    } else {
+      report.record(
+        '受控模式：不带令牌被拒（401/403）',
+        anonView.status === 401 || anonView.status === 403,
+        `POST /whep/${config.room}（无 ?k=）→ HTTP ${anonView.status}`,
+      )
+    }
 
+    if (config.openMode) {
+      // 开放模式下没有「观看令牌」这个概念，硬塞一个错的也没有意义：
+      // 说明清楚并跳过，绝不算失败。
+      report.note(
+        '开放模式：跳过「错误观看令牌 → 401」这条（VIEW_TOKEN 为空，观看端本来就不校验令牌）。' +
+          '要验受控模式，在 .env 里给 VIEW_TOKEN 填个值再跑。',
+      )
+    } else {
+      const badView = await fetch(`${config.base}/whep/${config.room}?k=nope-nope-nope`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: 'v=0',
+        signal: AbortSignal.timeout(10000),
+      }).catch((error) => ({ status: `连不上（${error.message}）` }))
+      report.record(
+        '错误观看令牌被拒（401/403）',
+        badView.status === 401 || badView.status === 403,
+        `POST /whep/${config.room}?k=nope… → HTTP ${badView.status}`,
+      )
+    }
+
+    // 推流端不变，而且现在只有它一个门：令牌错、或者干脆不带，都必须 401。
     const badPublish = await fetch(`${config.base}/whip/${config.room}?k=nope-nope-nope`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/sdp' },
@@ -465,9 +604,21 @@ async function main() {
       `POST /whip/${config.room}?k=nope… → HTTP ${badPublish.status}`,
     )
 
+    const anonPublish = await fetch(`${config.base}/whip/${config.room}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp' },
+      body: 'v=0',
+      signal: AbortSignal.timeout(10000),
+    }).catch((error) => ({ status: `连不上（${error.message}）` }))
+    report.record(
+      '不带推流令牌被拒（401/403）—— 推流是唯一的门',
+      anonPublish.status === 401 || anonPublish.status === 403,
+      `POST /whip/${config.room}（无 ?k=）→ HTTP ${anonPublish.status}`,
+    )
+
     // 房间号写错必须是 404：掉到静态站上返回 200 + 一坨 HTML 是最坑的失败方式，
     // 客户端会拿 HTML 当 SDP 用，报错牛头不对马嘴。
-    const wrongWhep = await fetch(`${config.base}/whep/definitely-not-a-room?k=${encodeURIComponent(config.viewToken)}`, {
+    const wrongWhep = await fetch(withToken(`${config.base}/whep/definitely-not-a-room`, config.viewToken), {
       method: 'POST',
       headers: { 'Content-Type': 'application/sdp' },
       body: 'v=0',
@@ -479,7 +630,7 @@ async function main() {
       `POST /whep/definitely-not-a-room → HTTP ${wrongWhep.status}`,
     )
 
-    const wrongHls = await fetch(`${config.base}/hls/definitely-not-a-room/index.m3u8?k=${encodeURIComponent(config.viewToken)}`, {
+    const wrongHls = await fetch(withToken(`${config.base}/hls/definitely-not-a-room/index.m3u8`, config.viewToken), {
       signal: AbortSignal.timeout(10000),
     }).catch((error) => ({ status: `连不上（${error.message}）` }))
     report.record(

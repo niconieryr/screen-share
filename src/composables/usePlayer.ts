@@ -8,12 +8,17 @@
  *                waiting（等待主播开播）──退避重试──▶ connecting
  *
  * 服务端明确说 404（这个房间里没有流）→ waiting，按退避一直试；
- * 401（令牌不对）→ unauthorized，重试多少次都一样，直接送回门禁页。
+ * 401（需要令牌 / 令牌不对）→ unauthorized，重试多少次都一样，交给上层去要令牌。
  *
  * 三条铁律：
  *   1. 音轨不是 Opus 就**不许**走 WebRTC —— 那会触发服务端转码，音质会毁
  *   2. WebRTC 建不起来就自动降级 HLS，观众不需要知道发生了什么，但页面要标出来
  *   3. 卡死要有看门狗兜底：字节/播放位置不再前进就重连，不能让人对着静止画面干等
+ *
+ * 起播一律 `video.muted = true`：浏览器只允许**静音**免手势自动播放，
+ * 这是「打开链接零点击就出画」的唯一办法。声音那一下免不掉，
+ * 由画面上的「点击开启声音」补（见 enableSound）—— 所以这个文件里没有
+ * 「先进门再播」的概念，start() 一调就往连接上冲。
  *
  * 和旧版的差别：新部署不暴露控制 API，所以没有「先问 /api/status 再决定连不连」
  * 这一步。「等待主播开播」直接由 WHEP/HLS 的失败结果驱动，配合退避重试；
@@ -223,7 +228,9 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>, session: Sessi
 
         whepSession = created
         video.srcObject = created.stream
-        video.muted = false
+        // 静音起播：浏览器只允许「静音」免手势自动播放，这是零点击出画的唯一办法。
+        // 声音那一下由画面上的「点击开启声音」补（见 enableSound）。
+        video.muted = true
 
         await waitForFirstTrack(created.stream, FIRST_TRACK_TIMEOUT_MS)
         if (gen !== generation) return { outcome: 'fatal', reason: '' }
@@ -271,7 +278,8 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>, session: Sessi
       }
 
       hlsHandle = handle
-      video.muted = false
+      // 同上：静音起播，声音由画面上的「点击开启声音」补
+      video.muted = true
       await video.play().catch(() => {
         needsManualPlay.value = true
       })
@@ -474,6 +482,27 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>, session: Sessi
     }
   }
 
+  /**
+   * 用户点了「开启声音」。
+   *
+   * 页面是静音自动播放起来的（不出声才免手势），所以这一下点击是**免不掉**的：
+   * 浏览器不允许页面在没有用户手势的情况下出声。
+   * 调用点一定在 click 处理器里 —— 带着用户手势摘静音，浏览器才认。
+   */
+  async function enableSound(): Promise<void> {
+    const video = videoRef.value
+    if (!video) return
+    video.muted = false
+    // 从 0 音量取消静音时给一个能听见的值，别出现「明明没静音却没声音」
+    if (video.volume === 0) video.volume = 0.8
+    try {
+      // 极少数情况下浏览器会在摘静音的瞬间把播放掐掉，补一次 play
+      await video.play()
+    } catch {
+      needsManualPlay.value = true
+    }
+  }
+
   onBeforeUnmount(() => {
     void stop()
   })
@@ -489,5 +518,6 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>, session: Sessi
     stop,
     retry,
     manualPlay,
+    enableSound,
   }
 }

@@ -18,7 +18,10 @@
  *   node scripts/load-test.mjs              # 默认 4 路
  *   node scripts/load-test.mjs --n=10
  *   node scripts/load-test.mjs --n=10 --seconds=20 --base=http://43.142.33.45:8443
- *   node scripts/load-test.mjs --view-token=… --publish-token=…
+ *   node scripts/load-test.mjs --publish-token=…
+ *
+ * 观看端是短链接公开访问：VIEW_TOKEN 为空（默认）时所有 WHEP 请求都不带 ?k=；
+ * 填了令牌就自动带上。推流令牌始终必填。
  *
  * 退出码 0 = 所有会话都建起来了，1 = 有失败。
  */
@@ -53,8 +56,9 @@ screen-share 并发压测（默认 N=4）
   --seconds=<秒>          码率采样时长（默认 15）
   --base=<url>            对外地址（默认 http://43.142.33.45:8443）
   --room=<名字>           房间号（默认 share01）
-  --view-token=<令牌>     观看令牌（默认环境变量 VIEW_TOKEN → .env）
-  --publish-token=<令牌>  推流令牌（默认环境变量 PUBLISH_TOKEN → .env）
+  --view-token=<令牌>     观看令牌（默认环境变量 VIEW_TOKEN → .env）。留空 = 开放模式，
+                          请求不带 ?k=；有值 = 受控模式，自动带上
+  --publish-token=<令牌>  推流令牌（默认环境变量 PUBLISH_TOKEN → .env），必填
   --canvas=1920x1080      合成推流的画布尺寸（默认 1280x720）
   --timeout=<秒>          整个脚本的总超时（默认 300）
   --help                  看这段
@@ -72,7 +76,8 @@ async function main() {
     return 0
   }
 
-  const config = resolveConfig(args, { need: ['viewToken', 'publishToken'] })
+  // 观看令牌可选（空 = 开放模式），推流令牌必填
+  const config = resolveConfig(args, { need: ['publishToken'] })
   const report = createReporter()
 
   const count = Number.parseInt(args.flags.n ?? '4', 10)
@@ -90,6 +95,7 @@ async function main() {
   console.log('screen-share 并发压测（只收不渲染，量的是服务端）')
   report.info(`目标       ${config.base}（来自 ${config.baseFrom}）`)
   report.info(`房间       ${config.room}`)
+  report.info(`观看入口   ${config.viewerURL}（${config.openMode ? '开放模式，请求不带 ?k=' : '受控模式，请求带 ?k='}）`)
   report.info(`并发路数   ${count} 路 recvonly WHEP`)
   report.info(`采样时长   ${seconds} 秒`)
 
@@ -104,10 +110,9 @@ async function main() {
   }
   report.record('目标可达', true, `${config.base} → HTTP ${reach.status}（${reach.ms}ms）`)
 
-  if (!config.viewToken || !config.publishToken) {
-    const missing = [!config.viewToken && '观看令牌', !config.publishToken && '推流令牌'].filter(Boolean)
-    report.record('令牌齐备', false, `缺 ${missing.join(' 和 ')}`)
-    report.note('用 --view-token=… / --publish-token=… 传，或设同名环境变量，或在项目根目录的 .env 里写。')
+  if (!config.publishToken) {
+    report.record('推流令牌齐备', false, '推流令牌是必填的 —— 少了它连合成推流都建不起来')
+    report.note('用 --publish-token=… 传，或设环境变量 PUBLISH_TOKEN，或在项目根目录 .env 里写 PUBLISH_TOKEN=…。')
     return report.summary('压测结果')
   }
 

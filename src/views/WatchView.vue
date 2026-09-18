@@ -2,11 +2,17 @@
 /**
  * 观看页 —— 观众看到的全部内容，也是这个应用**唯一**的一页。
  *
+ * 出画是**零点击**的：打开链接直接 start()，静音自动播放
+ * （浏览器只允许静音免手势播放，这是唯一能免掉那一下的办法）。
+ * 代价是没声音，而没声音会被当成故障 —— 所以画面上常驻一条显眼的
+ * 「点击开启声音」，点一下就摘掉静音。这一下点击是自动播放策略硬要求的，
+ * 免不掉，只能做得足够显眼。
+ *
+ * 只有在服务端返回 401（受控模式）时才会退回「需要令牌」的门禁；
+ * 默认的开放模式下观众永远看不到它。
+ *
  * 布局是「顶栏 / 分享条 / 舞台 / 控制栏」四段，全部纯色块，没有任何浮动元素和投影。
  * 所有会出错的地方都在舞台中央给出一个整块的说明态，而不是弹窗或 toast。
- *
- * 没有令牌的时候舞台上是门禁（粘链接进来），令牌被服务端拒了也会退回门禁 ——
- * 让人当场就能换一条链接，而不是对着一个「出错了」的死胡同。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
@@ -14,12 +20,13 @@ import ControlBar from '@/components/ControlBar.vue'
 import CopyField from '@/components/CopyField.vue'
 import Icon from '@/components/Icon.vue'
 import JoinGate from '@/components/JoinGate.vue'
+import SoundPrompt from '@/components/SoundPrompt.vue'
 import StatsPanel from '@/components/StatsPanel.vue'
 import StatusChip from '@/components/StatusChip.vue'
 import { usePlayer } from '@/composables/usePlayer'
 import { buildWatchUrl, FIXED_ROOM, readToken, type Session } from '@/lib/config'
 
-// 房间号是构建时常量，令牌只从地址栏来（换成粘贴进来的就当场写回地址栏）
+// 房间号是构建时常量；令牌默认是空串（开放模式），只有受控模式才从地址栏带进来
 const session = reactive<Session>({ room: FIXED_ROOM, token: readToken() })
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -34,10 +41,11 @@ const {
   needsManualPlay,
   start,
   retry,
+  enableSound,
 } = usePlayer(videoRef, session)
 
-const entered = ref(false)
-const muted = ref(false)
+const soundOn = ref(false)
+const muted = ref(true)
 const volume = ref(1)
 const paused = ref(true)
 const statsOpen = ref(false)
@@ -47,15 +55,16 @@ const pipSupported = ref(false)
 const controlsVisible = ref(true)
 
 const isPlaying = computed(() => phase.value === 'playing')
-const isLive = computed(() => phase.value === 'playing')
-const shareUrl = computed(() => (session.token ? buildWatchUrl(session.token) : ''))
+/** 短链接，不带令牌；受控模式下（地址栏里本来就有 ?k=）才跟着带上令牌 */
+const shareUrl = computed(() => buildWatchUrl(session.token))
 /** 服务端用 404 表示「房间里没有流」，也用来表示「房间路径不对」—— 后者是配置问题 */
 const looksLikeMissingPath = computed(() => waitReason.value.includes('404'))
 
 type OverlayKind = 'none' | 'gate' | 'connecting' | 'waiting' | 'reconnecting' | 'error' | 'tap'
 
 const overlay = computed<OverlayKind>(() => {
-  if (!entered.value || phase.value === 'unauthorized') return 'gate'
+  // 401 才要令牌；其余情况一律不拦人
+  if (phase.value === 'unauthorized') return 'gate'
   if (needsManualPlay.value) return 'tap'
   switch (phase.value) {
     case 'idle':
@@ -72,19 +81,22 @@ const overlay = computed<OverlayKind>(() => {
   }
 })
 
+/** 出画了但还没开声 → 把「点击开启声音」摆在正中间 */
+const showSoundPrompt = computed(() => isPlaying.value && !soundOn.value && overlay.value === 'none')
+
 const errorText = computed(() => errorMessage.value || '出了点问题')
 
 // ------------------------------------------------------------------ 交互
 
+/** 受控模式：观众把带令牌的链接粘进来 */
 function onEnter(token: string): void {
   if (token && token !== session.token) {
     session.token = token
-    // 地址栏跟着更新：这样随手把地址栏复制给别人，对方拿到的就是一条能用的链接
+    // 地址栏跟着更新，这样随手把地址栏复制给别人，对方拿到的就是一条能用的链接
     const url = new URL(window.location.href)
     url.searchParams.set('k', token)
     window.history.replaceState(null, '', url)
   }
-  entered.value = true
   start()
 }
 
@@ -94,6 +106,12 @@ function syncMediaState(): void {
   muted.value = video.muted
   volume.value = video.volume
   paused.value = video.paused
+}
+
+/** 开声：记住已经开过，之后手动静音也不再弹提示 */
+async function turnOnSound(): Promise<void> {
+  soundOn.value = true
+  await enableSound()
 }
 
 async function togglePlay(): Promise<void> {
@@ -106,12 +124,29 @@ async function togglePlay(): Promise<void> {
   }
 }
 
+/**
+ * 点画面。
+ * 还在静音时，第一次点击先用来开声（别让用户以为坏了）；
+ * 开过声之后才恢复成「点一下暂停/播放」。
+ */
+function onVideoClick(): void {
+  if (!isPlaying.value) return
+  if (!soundOn.value) {
+    void turnOnSound()
+    return
+  }
+  void togglePlay()
+}
+
 function toggleMute(): void {
   const video = videoRef.value
   if (!video) return
   video.muted = !video.muted
-  // 从 0 音量取消静音时给一个能听见的值，别出现「明明没静音却没声音」
-  if (!video.muted && video.volume === 0) video.volume = 0.8
+  if (!video.muted) {
+    soundOn.value = true
+    // 从 0 音量取消静音时给一个能听见的值，别出现「明明没静音却没声音」
+    if (video.volume === 0) video.volume = 0.8
+  }
 }
 
 function updateVolume(value: number): void {
@@ -119,6 +154,7 @@ function updateVolume(value: number): void {
   if (!video) return
   video.volume = value
   video.muted = value === 0
+  if (!video.muted) soundOn.value = true
 }
 
 async function toggleFullscreen(): Promise<void> {
@@ -169,14 +205,15 @@ function onKeydown(event: KeyboardEvent): void {
   if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
     return
   }
-  // 门禁页上键盘要留给输入框；令牌被拒时也会退回门禁，同样不抢
+  // 要令牌的那一页，键盘留给输入框
   if (overlay.value === 'gate') return
 
   switch (event.key) {
     case ' ':
     case 'k':
       event.preventDefault()
-      void togglePlay()
+      if (!soundOn.value && isPlaying.value) void turnOnSound()
+      else void togglePlay()
       break
     case 'm':
       toggleMute()
@@ -207,7 +244,7 @@ let hiddenAt = 0
 
 function onVisibilityChange(): void {
   const video = videoRef.value
-  if (!video || !entered.value) return
+  if (!video) return
 
   if (document.hidden) {
     hiddenAt = Date.now()
@@ -244,6 +281,8 @@ onMounted(() => {
   document.addEventListener('pointermove', showControls, { passive: true })
 
   showControls()
+  // 不再有「进门」这一步：挂载即开连，零点击出画
+  start()
 })
 
 onBeforeUnmount(() => {
@@ -268,7 +307,7 @@ onBeforeUnmount(() => {
       <div class="topbar__left">
         <Icon name="monitor" :size="16" />
         <span class="topbar__room num">{{ session.room || '—' }}</span>
-        <span v-if="isLive" class="live">
+        <span v-if="isPlaying" class="live">
           <span class="live__dot" aria-hidden="true" />
           <span>LIVE</span>
         </span>
@@ -279,8 +318,8 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <!-- 分享条：链接文本永远摊在页面上，可选中、可读，不是只给一个按钮 -->
-    <div v-if="shareUrl" class="sharebar">
+    <!-- 分享条：短链接，拿到就能看。链接文本永远摊在页面上，可选中、可读 -->
+    <div class="sharebar">
       <CopyField label="观看链接" :value="shareUrl" />
     </div>
 
@@ -297,16 +336,15 @@ onBeforeUnmount(() => {
         class="stage__video"
         playsinline
         preload="none"
+        :muted="true"
         @volumechange="syncMediaState"
-        @click="togglePlay"
+        @click="onVideoClick"
       />
 
       <JoinGate
         v-if="overlay === 'gate'"
         :room="session.room"
         :token="session.token"
-        :share-url="shareUrl"
-        :unauthorized="phase === 'unauthorized'"
         @enter="onEnter"
       />
 
@@ -357,6 +395,8 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </div>
+
+      <SoundPrompt v-if="showSoundPrompt" @enable="turnOnSound" />
 
       <div v-if="statsOpen && stats" class="stage__stats">
         <StatsPanel :stats="stats" />

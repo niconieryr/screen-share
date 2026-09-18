@@ -89,7 +89,7 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 $config = Read-DotEnv -Path $envPath
 $required = @(
     'PUBLIC_HOST', 'PUBLIC_PORT', 'ADVERTISE_IP',
-    'ROOM', 'VIEW_TOKEN', 'PUBLISH_TOKEN',
+    'ROOM', 'PUBLISH_TOKEN',
     'MTX_HLS_PORT', 'MTX_WEBRTC_PORT', 'MTX_API_PORT', 'MTX_WEBRTC_UDP_PORT'
 )
 $missing = $required | Where-Object { -not $config.ContainsKey($_) -or [string]::IsNullOrWhiteSpace($config[$_]) }
@@ -98,18 +98,57 @@ if ($missing) { throw ".env 里缺少这些键：$($missing -join ', ')" }
 if ($config['ROOM'] -notmatch '^[a-z0-9]{6,32}$') {
     throw "ROOM '$($config['ROOM'])' 不合法：只允许小写字母和数字，长度 6-32 位（要和 nginx 正则一致）。"
 }
-foreach ($key in @('VIEW_TOKEN', 'PUBLISH_TOKEN')) {
-    if ($config[$key].Length -lt 16) { throw "$key 太短了，至少 16 位。" }
-    if ($config[$key] -match '__') { throw "$key 里不能出现连续下划线（会和模板占位符冲突）。" }
+
+# 观看入口：短链接路径 + 可选令牌
+$viewPath = if ($config.ContainsKey('VIEW_PATH') -and -not [string]::IsNullOrWhiteSpace($config['VIEW_PATH'])) {
+    $config['VIEW_PATH'].Trim('/')
+} else {
+    'screen'
 }
-if ($config['VIEW_TOKEN'] -eq $config['PUBLISH_TOKEN']) { throw '观看令牌和推流令牌不能是同一个。' }
+if ($viewPath -notmatch '^[a-z0-9._-]{1,64}$') {
+    throw "VIEW_PATH '$viewPath' 不合法：只允许小写字母、数字、点、下划线、短横线，长度 1-64。"
+}
+$viewToken = if ($config.ContainsKey('VIEW_TOKEN')) { $config['VIEW_TOKEN'].Trim() } else { '' }
+
+if ($config['PUBLISH_TOKEN'].Length -lt 16) { throw 'PUBLISH_TOKEN 太短了，至少 16 位。' }
+foreach ($key in @('PUBLISH_TOKEN', 'VIEW_TOKEN')) {
+    if ($config.ContainsKey($key) -and $config[$key] -match '__') { throw "$key 里不能出现连续下划线（会和模板占位符冲突）。" }
+}
+if ($viewToken -and $viewToken -eq $config['PUBLISH_TOKEN']) { throw '观看令牌和推流令牌不能是同一个。' }
 if ($config['MTX_WEBRTC_UDP_PORT'] -eq '443') {
     throw 'WebRTC 媒体端口不能用 443：AcePanel 的 nginx 已经占了 443/udp（HTTP/3），MediaMTX 绑不上去。'
 }
 
+# 观看侧守卫：VIEW_TOKEN 留空就是开放观看（默认），填上才渲染出校验。
+# 推流侧永远要令牌 —— 那个不能公开，否则别人能顶掉你的推流。
+$nl = "`n"
+$i8 = '        '
+if ($viewToken) {
+    $whepGuard = $i8 + 'if ($arg_k != "' + $viewToken + '") { return 401; }'
+    $hlsGuard = @(
+        ($i8 + 'set $sc_ok 0;'),
+        ($i8 + 'if ($arg_k = "' + $viewToken + '") { set $sc_ok 1; }'),
+        ($i8 + 'if ($cookie_sc_k = "' + $viewToken + '") { set $sc_ok 1; }'),
+        ($i8 + 'if ($sc_ok = 0) { return 401; }'),
+        '',
+        ($i8 + 'add_header Set-Cookie "sc_k=' + $viewToken + '; Path=/; Max-Age=43200; SameSite=Lax" always;')
+    ) -join $nl
+    $viewTokenQs = '?k=' + $viewToken
+    $viewMode = "受控（观看要带 ?k= 令牌）"
+} else {
+    $whepGuard = $i8 + '# 开放观看：.env 的 VIEW_TOKEN 留空，这里不校验令牌'
+    $hlsGuard = $i8 + '# 开放观看：HLS 不需要令牌，也就用不着那个 cookie'
+    $viewTokenQs = ''
+    $viewMode = '开放（谁拿到链接都能看）'
+}
+
 $base = "http://$($config['PUBLIC_HOST']):$($config['PUBLIC_PORT'])"
+$watchUrl = "$base/$viewPath"
+if ($viewToken) { $watchUrl += "?k=$viewToken" }
+
 Write-Step '0/6 检查配置'
 Write-Ok "对外 $base，房间 $($config['ROOM'])"
+Write-Ok "观看 $watchUrl（$viewMode）"
 
 # ------------------------------------------------------------------ 2. 构建
 
@@ -143,7 +182,10 @@ $values = @{
     ADVERTISE_IP        = $config['ADVERTISE_IP']
     # 房间号是固化的：nginx 的正则、MediaMTX 的 paths、前端构建，三处用的是同一个值
     ROOM                = $config['ROOM']
-    VIEW_TOKEN          = $config['VIEW_TOKEN']
+    VIEW_PATH           = $viewPath
+    WHEP_VIEW_GUARD     = $whepGuard
+    HLS_VIEW_GUARD      = $hlsGuard
+    VIEW_TOKEN_QS       = $viewTokenQs
     PUBLISH_TOKEN       = $config['PUBLISH_TOKEN']
     MTX_HLS_PORT        = $config['MTX_HLS_PORT']
     MTX_WEBRTC_PORT     = $config['MTX_WEBRTC_PORT']
@@ -194,17 +236,22 @@ Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "bash $installArgs") -Wha
 
 # ------------------------------------------------------------------ 6. 汇总
 
-$watch = "$base/?k=$($config['VIEW_TOKEN'])"
 $whip = "$base/whip/$($config['ROOM'])`?k=$($config['PUBLISH_TOKEN'])"
 
 Write-Step '5/6 完成'
 Write-Host ''
-Write-Host '  观众链接（直接发给别人）' -ForegroundColor Green
-Write-Host "    $watch"
+Write-Host '  观看链接（直接发给别人，打开就能看）' -ForegroundColor Green
+Write-Host "    $watchUrl"
 Write-Host ''
 Write-Host '  OBS 推流（服务选 WHIP，服务器填这条）' -ForegroundColor Green
 Write-Host "    $whip"
 Write-Host ''
-Write-Warn2 'WebRTC 媒体走 UDP，腾讯云安全组入站必须放行'
-Write-Warn2 "  UDP $($config['MTX_WEBRTC_UDP_PORT'])（对外的 $($config['PUBLIC_PORT'])/tcp 本来就在安全组里，不用动）"
-Write-Warn2 '放行后跑 node scripts/e2e.mjs 验端到端；码率按 docs/OBS-设置.md 里的预设选。'
+if ($viewToken) {
+    Write-Warn2 '观看是受控模式：链接里的 ?k= 是观看令牌，漏掉就打不开。'
+    Write-Warn2 '想改成开放观看：把 .env 的 VIEW_TOKEN 留空重跑部署。'
+} else {
+    Write-Warn2 '观看是开放模式：链接本身不保密，别贴到公开的地方。'
+    Write-Warn2 "想收回：把 .env 的 VIEW_PATH 改成随机串（如 $viewPath-$([guid]::NewGuid().ToString('N').Substring(0,6))）重跑部署。"
+}
+Write-Warn2 '推流令牌（OBS 那条）千万不能外发，否则别人能顶掉你的推流。'
+Write-Warn2 "WebRTC 媒体走 UDP $($config['MTX_WEBRTC_UDP_PORT'])，腾讯云安全组入站要放行（对外的 $($config['PUBLIC_PORT'])/tcp 本来就在安全组里）。"

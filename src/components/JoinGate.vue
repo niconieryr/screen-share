@@ -1,32 +1,25 @@
 <script setup lang="ts">
 /**
- * 首屏门禁。
+ * 「需要令牌」门禁 —— 只在服务端返回 401 时出现。
  *
- * 这不是装饰 —— 浏览器的自动播放策略禁止页面在**没有用户手势**的情况下出声。
- * 与其先静音自动播放、再在角落提示「点击开启声音」（大多数人不看），
- * 不如把这一次点击做成进入房间的仪式：点完就出声，状态只有一种。
+ * 默认的开放模式（短链接谁拿到谁能看）下观众**永远看不到这个界面**：
+ * 页面打开就直接往 WHEP 上冲，零点击出画。
+ * 只有服务端开了受控模式（把 VIEW_TOKEN 填上、nginx 开始要 $arg_k），
+ * 或者观众拿到的是一条被别人改动过的旧链接时，才会退到这里。
  *
- * 两种形态：
- *   - 地址栏里没有 ?k=，或者手上的令牌被服务端拒了 → 让人粘一条新链接进来
- *   - 令牌没问题 → 确认一下房间和链接，点进去
- *
- * 令牌只活在地址栏里，**不落 localStorage**：存起来的话「没带令牌」这个状态
- * 就永远不会出现，门禁也就形同虚设了。
+ * 这时没有别的办法：观众手里那条地址不带令牌，前端也变不出来，
+ * 只能用输入框把分享者给的完整链接（或单独一串令牌）要过来。
+ * 令牌只活在地址栏里，**不落 localStorage**。
  */
 import { computed, ref } from 'vue'
 
-import CopyField from './CopyField.vue'
 import Icon from './Icon.vue'
 import { parseToken } from '@/lib/config'
 
 const props = defineProps<{
   room: string
-  /** 地址栏里带进来的令牌，空串表示没有 */
+  /** 地址栏里带进来的令牌，空串表示压根没带 */
   token: string
-  /** 有令牌时可以直接发出去的完整观看链接 */
-  shareUrl: string
-  /** 令牌被服务端拒了（HTTP 401） */
-  unauthorized?: boolean
 }>()
 
 const emit = defineEmits<{ (e: 'enter', token: string): void }>()
@@ -34,20 +27,13 @@ const emit = defineEmits<{ (e: 'enter', token: string): void }>()
 const draft = ref('')
 const localError = ref('')
 
-/** 需要用户输入：手上没有令牌，或者已有的令牌已经被服务端拒了 */
-const needsInput = computed(() => props.token === '' || props.unauthorized === true)
-
-const warning = computed(() => localError.value)
+/** 地址里本来就带了令牌还是被拒 → 那条令牌不对或过期了 */
+const hadToken = computed(() => props.token.length > 0)
 
 function submit(): void {
-  if (!needsInput.value) {
-    emit('enter', props.token)
-    return
-  }
-
   const text = draft.value.trim()
   if (!text) {
-    localError.value = '把分享给你的链接，或者 ?k= 后面那串令牌，粘到这里。'
+    localError.value = '把分享者给你的完整链接，或者 ?k= 后面那串令牌，粘到这里。'
     return
   }
 
@@ -68,45 +54,39 @@ function submit(): void {
       <p class="gate__kicker">屏幕共享</p>
       <h1 class="gate__room num">{{ room || '—' }}</h1>
 
-      <template v-if="needsInput">
-        <p class="gate__desc">
-          把分享者给你的<strong>完整链接</strong>粘进来，或者只粘 <code>?k=</code>
-          后面那串令牌。
-        </p>
-
-        <input
-          v-model="draft"
-          class="gate__input num"
-          type="text"
-          placeholder="http://…/?k=… 或者直接贴令牌"
-          spellcheck="false"
-          autocomplete="off"
-          @input="localError = ''"
-          @keydown.enter="submit"
-        />
-      </template>
-
-      <template v-else>
-        <p class="gate__desc">
-          链接已经带上令牌了。点下面的按钮进入，<strong>点一下就会开始播放并打开声音</strong>。
-        </p>
-        <CopyField label="观看链接" :value="shareUrl" />
-      </template>
-
-      <p v-if="unauthorized" class="gate__warn">
-        <Icon name="alert" :size="16" />
-        <span>链接不对或已失效（服务端返回 401）。找分享者要一条新的完整链接。</span>
+      <p class="gate__desc">
+        <strong>这次需要令牌。</strong>
+        服务端开了受控模式，光有短链接进不来 —— 把分享者给你的完整链接（带 <code>?k=</code>
+        的那种）整条粘进来。
       </p>
 
-      <p v-else-if="warning" class="gate__warn">
+      <input
+        v-model="draft"
+        class="gate__input num"
+        type="text"
+        placeholder="粘贴完整链接，或者只贴令牌"
+        spellcheck="false"
+        autocomplete="off"
+        @input="localError = ''"
+        @keydown.enter="submit"
+      />
+
+      <p v-if="localError" class="gate__warn">
         <Icon name="alert" :size="16" />
-        <span>{{ warning }}</span>
+        <span>{{ localError }}</span>
+      </p>
+
+      <p v-else-if="hadToken" class="gate__warn">
+        <Icon name="alert" :size="16" />
+        <span>地址里那条令牌不对或已失效（服务端返回 401），换一条新的试试。</span>
       </p>
 
       <button type="button" class="gate__btn" @click="submit">
         <Icon name="play" :size="18" />
-        <span>进入房间</span>
+        <span>继续观看</span>
       </button>
+
+      <p class="gate__note">服务端一直是开放模式的话，正常链接不会看到这个页面。</p>
     </div>
   </div>
 </template>
@@ -222,5 +202,10 @@ code {
 
 .gate__btn:active {
   transform: scale(0.99);
+}
+
+.gate__note {
+  font-size: var(--fs-xs);
+  color: var(--fg-dim);
 }
 </style>

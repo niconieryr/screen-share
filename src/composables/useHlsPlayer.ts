@@ -9,7 +9,7 @@
  */
 import type HlsJs from 'hls.js'
 
-import { origin } from '@/lib/config'
+import { origin, withToken } from '@/lib/config'
 
 /** HLS 播放失败。status 是服务端 HTTP 状态码，拿不到时为 0。 */
 export class HlsPlaybackError extends Error {
@@ -44,8 +44,8 @@ export async function startHls(
   room: string,
   token: string,
 ): Promise<HlsHandle> {
-  // 令牌只在**第一个**请求上带，nginx 会据此种下 cookie；
-  // 后面的分片请求不带 query，靠 cookie 通过。
+  // 令牌只在**第一个**请求上带（而且只有页面 URL 里带了 ?k= 才带），
+  // nginx 会据此种下 cookie；后面的分片请求不带 query，靠 cookie 通过。
   //
   // 两个坑都在服务端解决掉了，这里不用管：
   //   1. hls.js 请求分片时不会把播放列表上的 query 带过去，所以令牌必须走 cookie，
@@ -53,7 +53,7 @@ export async function startHls(
   //      必须带 ?k=，之后 xhrSetup 里什么都不用加。
   //   2. nginx 会把 query 整个换成固定的 cookieCheck=1，顺手把令牌从后续请求里抹掉
   //      （不然参数会一轮轮累积，init 分片地址每次都变，客户端反复重下）。
-  const url = `${origin()}/hls/${room}/index.m3u8?k=${encodeURIComponent(token)}`
+  const url = withToken(`${origin()}/hls/${room}/index.m3u8`, token)
 
   const { default: Hls } = await import('hls.js')
 

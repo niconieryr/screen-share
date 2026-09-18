@@ -26,6 +26,8 @@ export const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 export const DEFAULT_BASE = 'http://43.142.33.45:8443'
 /** 房间号在新部署里是固化的：nginx 只认这一个，MediaMTX 那边叫 r-share01 */
 export const DEFAULT_ROOM = 'share01'
+/** 观看端的短链接路径：http://43.142.33.45:8443/screen —— 公开访问，不带令牌 */
+export const DEFAULT_VIEW_PATH = 'screen'
 /** 出口带宽（最硬的约束）：4 Mbps。留给观众的上限，不是目标值 */
 export const EGRESS_BUDGET_MBPS = 4
 /** 预留 15% 余量后的出口目标：4 × 0.85 = 3.4 Mbps */
@@ -62,6 +64,22 @@ export function normalizeBase(value) {
   const trimmed = String(value ?? '').trim().replace(/\/+$/, '')
   if (!trimmed) return DEFAULT_BASE
   return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
+}
+
+/**
+ * 拼 URL 时带上观看令牌：**只有令牌非空才拼 `?k=`**。
+ *
+ * 观看端现在是「短链接公开访问」：`VIEW_TOKEN` 为空 = 开放模式（默认），
+ * 此时请求里必须**完全没有** k 参数 —— 拼一个空的 `?k=` 会被 nginx 当成
+ * 「令牌不等于配置值」直接 401，看起来像服务端坏了，其实是脚本自己加错了参数。
+ * `VIEW_TOKEN` 非空 = 受控模式，那就照旧带上。
+ */
+export function withToken(url, token) {
+  const trimmed = typeof token === 'string' ? token.trim() : ''
+  if (!trimmed) return url
+  const parsed = new URL(url)
+  parsed.searchParams.set('k', trimmed)
+  return parsed.href
 }
 
 /**
@@ -130,7 +148,7 @@ export function resolveConfig(args, { need = [] } = {}) {
   const viewFlag = text(flags['view-token'])
   const viewEnv = text(process.env.VIEW_TOKEN)
   let viewToken = ''
-  let viewTokenFrom = '（没有）'
+  let viewTokenFrom = '（没有 → 开放模式）'
   if (viewFlag) [viewToken, viewTokenFrom] = [viewFlag, '命令行 --view-token']
   else if (viewEnv) [viewToken, viewTokenFrom] = [viewEnv, '环境变量 VIEW_TOKEN']
   else if (text(env.VIEW_TOKEN)) [viewToken, viewTokenFrom] = [text(env.VIEW_TOKEN), '.env（VIEW_TOKEN）']
@@ -144,6 +162,16 @@ export function resolveConfig(args, { need = [] } = {}) {
   else if (text(env.PUBLISH_TOKEN))
     [publishToken, publishTokenFrom] = [text(env.PUBLISH_TOKEN), '.env（PUBLISH_TOKEN）']
 
+  // 观看短链接的路径段。`/screen` 就是默认值，`.env` 里用 VIEW_PATH 改。
+  const viewPathFlag = text(flags['view-path'])
+  const viewPathEnv = text(process.env.VIEW_PATH)
+  let viewPath = DEFAULT_VIEW_PATH
+  let viewPathFrom = '内置默认值'
+  if (viewPathFlag) [viewPath, viewPathFrom] = [viewPathFlag, '命令行 --view-path']
+  else if (viewPathEnv) [viewPath, viewPathFrom] = [viewPathEnv, '环境变量 VIEW_PATH']
+  else if (text(env.VIEW_PATH)) [viewPath, viewPathFrom] = [text(env.VIEW_PATH), '.env（VIEW_PATH）']
+  viewPath = String(viewPath).replace(/^\/+|\/+$/g, '') || DEFAULT_VIEW_PATH
+
   const config = {
     base,
     baseFrom,
@@ -153,10 +181,21 @@ export function resolveConfig(args, { need = [] } = {}) {
     viewTokenFrom,
     publishToken,
     publishTokenFrom,
+    viewPath,
+    viewPathFrom,
+    // 观看令牌为空就是**开放模式**：/screen 谁都能看，请求里不带 k 参数。
+    // 这是默认形态；填了令牌才回到受控模式。断言怎么判全看这个开关。
+    openMode: !viewToken,
     env,
     missing: need.filter((key) => !text({ viewToken, publishToken, room, base }[key])),
   }
+  config.viewerURL = viewerUrl(config)
   return config
+}
+
+/** 观众页地址：开放模式就是光秃秃的短链接，受控模式才拼 ?k= */
+export function viewerUrl(config) {
+  return withToken(`${config.base}/${config.viewPath}`, config.viewToken)
 }
 
 // ------------------------------------------------------------------ 输出
@@ -208,19 +247,38 @@ export function createReporter() {
   }
 }
 
-/** 顶层兜底：用户看得懂的错误只打一行，别的才带堆栈（也压成一行）。 */
+/**
+ * 把错误压成一行人话。
+ * 页面里（page.evaluate）抛出来的 Error，message 里会带一整段 JS 栈 ——
+ * 对看日志的人来说那是噪音，只留第一行的原因就够了。
+ */
+export function readableError(error) {
+  const raw = String(error?.message ?? error ?? '未知错误')
+  return raw
+    .replace(/^page\.evaluate:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+    .split('\n')[0]
+    .trim()
+}
+
+/**
+ * 顶层兜底：用户看得懂的错误只打一行，别的才带堆栈（也压成一行）。
+ */
 export function reportFatal(error) {
   if (error instanceof FriendlyError) {
     console.error(`\n${RED}✗${OFF} ${error.message}`)
     return
   }
-  console.error(`\n${RED}✗${OFF} 执行中断：${error?.message ?? String(error)}`)
-  const stack = String(error?.stack ?? '')
-    .split('\n')
-    .slice(1, 4)
-    .map((line) => `    ${line.trim()}`)
-    .join('\n')
-  if (stack) console.error(stack)
+  console.error(`\n${RED}✗${OFF} 执行中断：${readableError(error)}`)
+  // 页面内的错误已经把栈写在 message 里了，别再叠一层
+  if (!String(error?.message ?? '').includes('\n')) {
+    const stack = String(error?.stack ?? '')
+      .split('\n')
+      .slice(1, 4)
+      .map((line) => `    ${line.trim()}`)
+      .join('\n')
+    if (stack) console.error(stack)
+  }
 }
 
 /**
@@ -524,7 +582,7 @@ export async function readSenderStats(page, { waitMs = 0 } = {}) {
  * 另外 DELETE **必须在 pc.close() 之前**发。反过来的话 MediaMTX 已经把会话回收了，
  * DELETE 只会拿到 404 session not found —— 那是测试自己造出来的假失败（踩过）。
  */
-const IN_PAGE_WHEP = async ({ base, room, token, waitMs, attachVideo }) => {
+const IN_PAGE_WHEP = async ({ whepUrl, base, waitMs, attachVideo }) => {
   const settle = (pc) =>
     new Promise((resolve) => {
       if (pc.iceGatheringState === 'complete') return resolve()
@@ -564,7 +622,7 @@ const IN_PAGE_WHEP = async ({ base, room, token, waitMs, attachVideo }) => {
   await pc.setLocalDescription(await pc.createOffer())
   await settle(pc)
 
-  const response = await fetch(`${base}/whep/${room}?k=${encodeURIComponent(token)}`, {
+  const response = await fetch(whepUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/sdp', Accept: 'application/sdp' },
     body: pc.localDescription.sdp,
@@ -635,9 +693,11 @@ const IN_PAGE_WHEP = async ({ base, room, token, waitMs, attachVideo }) => {
 /**
  * 自己建一路 WHEP 会话，读接收侧统计（顺便验一遍 DELETE）。
  * 默认不接 <video>（不解码）；要验「浏览器真能解出画面」就传 attachVideo: true。
+ * 令牌可选：开放模式（VIEW_TOKEN 为空）下请求里不带 k 参数。
  */
-export async function readReceivedStats(page, { base, room, token, waitMs = 4000, attachVideo = false }) {
-  return page.evaluate(IN_PAGE_WHEP, { base, room, token, waitMs, attachVideo })
+export async function readReceivedStats(page, { base, room, token = '', waitMs = 4000, attachVideo = false }) {
+  const whepUrl = withToken(`${base}/whep/${room}`, token)
+  return page.evaluate(IN_PAGE_WHEP, { whepUrl, base, waitMs, attachVideo })
 }
 
 /** 从 SDP 里抠出服务端同意的编码，用来断言「音轨就是 Opus」。 */
@@ -651,14 +711,17 @@ export function sdpCodecs(sdp) {
 }
 
 /**
- * 看 nginx 有没有把 MediaMTX 的 Location 改写回对外路径，并带上令牌。
+ * 看 nginx 有没有把 MediaMTX 的 Location 改写回对外路径，令牌该带就带、不该带就不带。
  *
  * 这条是旧项目踩过的坑：MediaMTX 会把自己收到的 query 原样回显进 Location，
- * 要是 nginx 改写成 /whep/<房间>/<会话>?k=<令牌> 时又拼一遍原始 query，
- * 就变成 ?k=xxx?k=xxx —— 令牌对不上，DELETE 被自己的 401 拦掉，
- * 会话要挂到 ICE 超时（约 30 秒）才消失。所以这里逐项看清楚。
+ * 要是 nginx 改写时又拼一遍 query，就变成 ?k=xxx?k=xxx —— 令牌对不上，
+ * DELETE 被自己的 401 拦掉，会话要挂到 ICE 超时（约 30 秒）才消失。
+ *
+ * 现在观看端是短链接公开访问，开放模式下 Location **本来就不该有令牌**，
+ * 所以判据分两种：受控模式要求 k 等于配置的令牌；开放模式只要求没有重复 query。
+ * 两种模式都要求路径是 /whep/<房间>/…（不能漏出内部的 /r-<房间>/…）。
  */
-export function inspectWhepLocation(base, room, location, viewToken) {
+export function inspectWhepLocation(base, room, location, viewToken = '') {
   if (!location) return { ok: false, url: null, why: '响应里没有 Location 头' }
   let url
   try {
@@ -672,13 +735,19 @@ export function inspectWhepLocation(base, room, location, viewToken) {
   if (!url.pathname.startsWith(`/whep/${room}/`)) {
     return { ok: false, url: url.href, why: `路径不是 /whep/${room}/… 而是 ${url.pathname}` }
   }
+  // 两个问号 = query 被拼了两遍，不管哪种模式都是错
+  if ((String(location).match(/\?/g) ?? []).length > 1) {
+    return { ok: false, url: url.href, why: `Location 里有多个 ?，query 被拼了两遍：${location}` }
+  }
   const token = url.searchParams.get('k')
-  if (!token) return { ok: false, url: url.href, why: 'Location 里没有 ?k= 令牌，后续 DELETE 会被 401 拦掉' }
-  if (viewToken && token !== viewToken) {
-    return {
-      ok: false,
-      url: url.href,
-      why: `?k= 的值不等于观看令牌（实际 "${token}"）—— 典型的 query 回显把令牌拼了两遍`,
+  if (viewToken) {
+    if (!token) return { ok: false, url: url.href, why: '受控模式下 Location 里没有 ?k= 令牌，后续 DELETE 会被 401 拦掉' }
+    if (token !== viewToken) {
+      return {
+        ok: false,
+        url: url.href,
+        why: `?k= 的值不等于观看令牌（实际 "${token}"）—— 典型的 query 回显把令牌拼了两遍`,
+      }
     }
   }
   return { ok: true, url: url.href, why: '' }
@@ -689,14 +758,14 @@ export function inspectWhepLocation(base, room, location, viewToken) {
  * 推流刚 connected 的那一瞬间 MediaMTX 还没把流登记好，这时候拉流会
  * 404 no stream is available on path —— 实测踩到过，所以要有这个重试闸门。
  */
-const IN_PAGE_WHEP_PING = async ({ base, room, token }) => {
+const IN_PAGE_WHEP_PING = async ({ whepUrl, base }) => {
   const pc = new RTCPeerConnection({ iceServers: [] })
   pc.addTransceiver('video', { direction: 'recvonly' })
   pc.addTransceiver('audio', { direction: 'recvonly' })
   pc.ontrack = () => {}
   try {
     await pc.setLocalDescription(await pc.createOffer())
-    const response = await fetch(`${base}/whep/${room}?k=${encodeURIComponent(token)}`, {
+    const response = await fetch(whepUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/sdp' },
       body: pc.localDescription.sdp,
@@ -716,13 +785,14 @@ const IN_PAGE_WHEP_PING = async ({ base, room, token }) => {
 }
 
 /** 等流真的可拉：推流 connected 之后服务端往往还要一两秒才登记好。 */
-export async function waitForStreamReady(page, { base, room, token, timeoutMs = 25000, intervalMs = 1500 }) {
+export async function waitForStreamReady(page, { base, room, token = '', timeoutMs = 25000, intervalMs = 1500 }) {
+  const whepUrl = withToken(`${base}/whep/${room}`, token)
   const started = Date.now()
   let attempts = 0
   let last = { status: null, body: '' }
   while (Date.now() - started < timeoutMs) {
     attempts += 1
-    last = await page.evaluate(IN_PAGE_WHEP_PING, { base, room, token })
+    last = await page.evaluate(IN_PAGE_WHEP_PING, { whepUrl, base })
     if (last.ok) {
       return { ok: true, attempts, status: last.status, seconds: (Date.now() - started) / 1000 }
     }
@@ -746,9 +816,10 @@ export async function waitForStreamReady(page, { base, room, token, timeoutMs = 
  * 但不把流挂到 <video> 上就没有渲染、合成、上屏这些开销，跑压测的机器不会因为
  * 自己画不过来而拖慢结果。观众的解码是观众自己电脑的事，不该算在服务端容量里。
  */
-export async function openWhepSessions(page, { base, room, token, count }) {
+export async function openWhepSessions(page, { base, room, token = '', count }) {
+  const whepUrl = withToken(`${base}/whep/${room}`, token)
   return page.evaluate(
-    async ({ base, room, token, count }) => {
+    async ({ whepUrl, count }) => {
       const settle = (pc) =>
         new Promise((resolve) => {
           if (pc.iceGatheringState === 'complete') return resolve()
@@ -768,7 +839,7 @@ export async function openWhepSessions(page, { base, room, token, count }) {
           pc.ontrack = () => {}
           await pc.setLocalDescription(await pc.createOffer())
           await settle(pc)
-          const response = await fetch(`${base}/whep/${room}?k=${encodeURIComponent(token)}`, {
+          const response = await fetch(whepUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/sdp' },
             body: pc.localDescription.sdp,
@@ -783,7 +854,7 @@ export async function openWhepSessions(page, { base, room, token, count }) {
       window.__whepSessions = sessions
       return { connected: sessions.length, failures }
     },
-    { base, room, token, count },
+    { whepUrl, count },
   )
 }
 
@@ -865,12 +936,12 @@ export async function closeWhepSessions(page) {
  *   - MediaMTX 的 index.m3u8 是 **master**，里面只有 #EXT-X-STREAM-INF 和变体地址
  *     （video1_stream.m3u8?session=…、audio2_stream.m3u8?session=…），一个分片地址都没有。
  *     只抓 index.m3u8 就以为 HLS 通了，是自欺欺人 —— 实测变体那一步会 401。
- *   - 变体/分片请求**不带 ?k=**：nginx 只在第一个带令牌的请求上种 cookie，
- *     hls.js 请求分片时不会把播放列表的 query 带过去，全靠 cookie 通过。
- *     所以这里要模拟「先带令牌、后带 cookie」，而 Node 的 fetch 没有 cookie jar，
- *     就手搓一个最小实现（只存 name=value）。
+ *   - 变体/分片请求**不带 ?k=**（开放模式下本来就没有令牌这东西）。
+ *     这里仍然手搓一个最小 cookie jar（只存 name=value），是因为 MediaMTX 自己的
+ *     `cookieCheck`/`session` 机制要靠 cookie 和 302 串起来 —— 它已经不是鉴权手段了，
+ *     但少了 cookie 依然会取不到分片。Node 的 fetch 没有 cookie jar，只能自己来。
  */
-export async function probeHls(base, room, token, { timeoutMs = 15000, hops = 3 } = {}) {
+export async function probeHls(base, room, token = '', { timeoutMs = 15000, hops = 3 } = {}) {
   const jar = new Map()
   const trace = []
 
@@ -922,10 +993,9 @@ export async function probeHls(base, room, token, { timeoutMs = 15000, hops = 3 
     return found
   }
 
-  const masterUrl = new URL(`${base}/hls/${room}/index.m3u8`)
-  masterUrl.searchParams.set('k', token)
+  const masterUrl = withToken(`${base}/hls/${room}/index.m3u8`, token)
   // MediaMTX 的 HLS 是按需起的，第一个请求可能赶在分片就绪之前，所以不成再等 2 秒来一次
-  let master = await request(masterUrl.href)
+  let master = await request(masterUrl)
   if (!(master.status === 200 && master.body.includes('#EXTM3U'))) {
     await sleep(2000)
     master = await request(masterUrl.href)
@@ -992,8 +1062,10 @@ export async function probeHls(base, room, token, { timeoutMs = 15000, hops = 3 
 /**
  * 旧项目里 nginx 有个只读的 /api/status。新部署的 URL 契约里没有它，
  * 所以这里做成「有就用、没有就安静跳过」，绝不因为服务端没实现这个端点就判 FAIL。
+ * 这个端点自己是要令牌的，开放模式下干脆不发请求。
  */
 export async function fetchOptionalStatus(base, token, room, { timeoutMs = 6000 } = {}) {
+  if (!token) return { available: false, reason: '没有观看令牌（开放模式），这个端点本来就要令牌，跳过' }
   try {
     const response = await fetch(`${base}/api/status?k=${encodeURIComponent(token)}`, {
       cache: 'no-store',
