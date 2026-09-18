@@ -1,0 +1,22 @@
+# 依赖与构建产物
+node_modules/
+www/
+*.tsbuildinfo
+
+# 运行数据与日志
+data/
+*.log
+
+# 真实密钥绝不提交
+.env
+.env.local
+.env.*
+
+# 渲染结果（占位符已替换，含令牌）
+deploy/.rendered/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

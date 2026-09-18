@@ -1,0 +1,74 @@
+#################################################################
+# screen-share —— MediaMTX 配置【模板】
+#
+# 由 deploy/deploy.ps1 渲染成服务器上的 /srv/screen-share/mediamtx.yml。
+# 模板里的占位符会被 .env 的值替换。要改配置改这里，别改服务器上那份。
+#
+# 键名按 v1.21.0 核对过（moq / playback / webrtcAdditionalHosts 等都在）。
+#################################################################
+
+logLevel: info
+logDestinations: [stdout]
+logStructured: no
+
+# ---- 只开用得到的协议，其余全关，减少攻击面 ----
+rtsp: no
+rtmp: no
+srt: no
+# 1.21 默认开着 MoQ（会另外占用 8892/8893），这里用不上，关掉
+moq: no
+metrics: no
+pprof: no
+playback: no
+
+# ---- 控制 API ----
+# 只监听回环，不对公网暴露，nginx 也不反代它。
+# 用途只有一个：部署自检和排障时从宿主机读 /v3/paths/list。
+api: yes
+apiAddress: 127.0.0.1:__MTX_API_PORT__
+
+# ---- HLS：UDP 被封时的兜底，走普通 TCP ----
+hls: yes
+hlsAddress: 127.0.0.1:__MTX_HLS_PORT__
+hlsVariant: lowLatency
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentCount: 7
+hlsAlwaysRemux: no
+
+# ---- WebRTC：主路径，亚秒延迟 ----
+webrtc: yes
+webrtcAddress: 127.0.0.1:__MTX_WEBRTC_PORT__
+# 媒体走这个 UDP 口，必须与腾讯云安全组放行的一致。
+# 注意不能复用 443/udp：AcePanel 的 nginx 已经绑了它（HTTP/3），会直接 EADDRINUSE。
+webrtcLocalUDPAddress: :__MTX_WEBRTC_UDP_PORT__
+# 必须显式告诉客户端用哪个地址来连，否则观众永远建不起连接。
+# 腾讯云 CVM 的公网 IP 是 NAT 映射，网卡上只有 10.x 内网地址，
+# 所以这里**写死公网 IP**，并且把「从网卡收集地址」关掉
+# （否则会把 docker 网桥和 10.x 一起通告出去，观众拿到的候选全是不可达的）。
+webrtcAdditionalHosts: [__ADVERTISE_IP__]
+webrtcIPsFromInterfaces: no
+
+# ---- 鉴权 ----
+# 真正的门在 nginx：令牌由 nginx 校验，MediaMTX 只信任来自本机的请求。
+# 上面几个 HTTP 端口全部只绑 127.0.0.1，公网根本到不了这里。
+#
+# 注意 permissions 里的 action 是分开的：控制 API 归 'api' 管，少写一个
+# 读 /v3/paths/list 就是 401（旧项目自检时踩过）。
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: [127.0.0.1, ::1]
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
+# ---- 房间路径 ----
+# 房间号写死成这一个，**不开放 all_others**。
+# 只有你一个人推流，没必要让任意路径都能建流；没列出来的路径 MediaMTX 直接拒绝。
+# 前缀 r- 是为了跟 MediaMTX 内部可能的保留路径错开，nginx 负责改写过去。
+paths:
+  r-__ROOM__:

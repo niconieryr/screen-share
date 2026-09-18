@@ -1,0 +1,7 @@
+# 换行统一成 LF：项目在 Windows 上开发、部署到 Linux，
+# shell 脚本和渲染出来的 nginx/MediaMTX 配置都不该带 CRLF。
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.png binary
+*.woff2 binary

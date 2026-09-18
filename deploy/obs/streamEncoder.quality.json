@@ -1,0 +1,14 @@
+{
+    "rate_control": "CBR",
+    "bitrate": 1400,
+    "keyint_sec": 2,
+    "preset": "p5",
+    "tune": "ll",
+    "multipass": "disabled",
+    "profile": "high",
+    "lookahead": false,
+    "psycho_aq": false,
+    "bf": 0,
+    "gpu": 0,
+    "repeat_headers": true
+}

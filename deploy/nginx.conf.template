@@ -1,0 +1,170 @@
+# screen-share 公网入口【模板】
+#
+# 这份配置跑在 **screen-share-edge 容器**里（nginx:1.27-alpine，host 网络），
+# 由 deploy/deploy.ps1 渲染后推到服务器上的 /srv/screen-share/nginx.conf，
+# 再挂进容器覆盖镜像自带的 default.conf。要改就改这里，别改服务器上那份。
+#
+# 绑在 __PUBLIC_HOST__:__PUBLIC_PORT__ 上，**明文 http**：
+#   - 80/443 被 AcePanel 占着，我们用 8443（安全组已放行）。
+#   - 没有域名也就签不了真证书，而 OBS 对 HTTPS 的 WHIP 会**静默拒绝自签证书**，
+#     所以不做自签 HTTPS —— OBS 的 WHIP 本来就支持 http://，浏览器侧拉流
+#     （WHEP/HLS）也验证过不要求安全上下文。代价见 README。
+#
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/?k=<观看令牌>        观看页
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whep/__ROOM__?k=...  浏览器拉流（主路径，<1s）
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/hls/__ROOM__/...     LL-HLS 兜底（2-4s）
+#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whip/__ROOM__?k=...  OBS 推流
+#
+# 上游全在 127.0.0.1，而 MediaMTX 只信任本机请求，所以这里是唯一入口。
+#
+# ⚠ 静态站根目录写死 /opt/screen-share/www，和 compose 里的挂载点一致。
+
+server {
+    listen __PUBLIC_PORT__;
+    server_name _;
+
+    root  /opt/screen-share/www;
+    index index.html;
+
+    # 令牌就在 URL 里，别写进访问日志
+    access_log off;
+    # 这里必须是镜像里那条指向 /dev/stderr 的软链，否则报错只留在容器里，
+    # docker logs 什么都看不到（排查 HLS/WHEP 时就靠它）。
+    error_log  /var/log/nginx/error.log warn;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy          no-referrer always;
+
+    # ---- 存活探针（容器 healthcheck 打的就是这里）----
+    location = /healthz {
+        default_type text/plain;
+        return 200 'ok';
+    }
+
+    # ---- 前端产物 ----
+    # 带内容 hash 的产物可以长期强缓存
+    location /assets/ {
+        try_files $uri =404;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # 入口 HTML 绝不能缓存，否则发版后用户一直拿到旧壳子
+    location = /index.html {
+        add_header Cache-Control "no-store, must-revalidate";
+    }
+
+    # SPA：/ 回 index.html
+    location / {
+        try_files $uri /index.html;
+        add_header Cache-Control "no-store, must-revalidate";
+    }
+
+    # ---- WHEP：观众拉流（POST 建会话 / PATCH 补候选 / DELETE 结束）----
+    #
+    # 房间号是**写死的**：只有你一个人推流、只有一个房间，所以不按正则放开，
+    # 也没必要让 /whep/<任意房间> 都能路由。别处来的通通落到文件末尾的 404。
+    #
+    # 正则一律加引号：里面写了 [^?]* 这样的字符类，而 nginx 会把裸的 { 当成块起始符，
+    # 于是正则在那个位置被截断，报 "pcre_compile() failed: missing )"。
+    location ~ "^/whep/__ROOM__(/[^?]*)?$" {
+        if ($arg_k != "__VIEW_TOKEN__") { return 401; }
+
+        # 改写成本机 MediaMTX 的路径。用 rewrite+break、proxy_pass 不带 URI，
+        # 避免 nginx 在运行时解析上游地址。
+        #
+        # 结尾那个 ? 是**故意**的：它把原始 query 丢掉。MediaMTX 会把收到的 query
+        # 原样回显进 Location，我们再拼一次令牌就变成 ?k=xxx?k=xxx，DELETE 会被上面
+        # 那条 401 自己拦掉，会话残留到 ICE 超时（约 30 秒）。踩过一次了。
+        # 令牌只是我们 nginx 自己用的，MediaMTX 侧靠 127.0.0.1 白名单，不需要它。
+        rewrite "^/whep/__ROOM__(.*)$" /r-__ROOM__/whep$1? break;
+        proxy_pass http://127.0.0.1:__MTX_WEBRTC_PORT__;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+        # MediaMTX 返回的 Location 是**相对路径**（实测 /r-<房间>/whep/<会话>）。
+        # 不改写的话，浏览器会把后续 PATCH/DELETE 发到 /r-<房间>/whep/... 上去 ——
+        # 那个路径不匹配本 location，直接落到静态文件里变成 404。
+        # 正则里显式吃掉可能存在的 query（([^?]*)(\?.*)?），只保留路径部分，免得令牌拼两遍。
+        proxy_redirect ~^https?://[^/]+/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2?k=__VIEW_TOKEN__;
+        proxy_redirect ~^/r-([a-z0-9]+)/whep([^?]*)(\?.*)?$ /whep/$1$2?k=__VIEW_TOKEN__;
+    }
+
+    # ---- WHIP：OBS 推流 ----
+    location ~ "^/whip/__ROOM__(/[^?]*)?$" {
+        if ($arg_k != "__PUBLISH_TOKEN__") { return 401; }
+
+        # 同上：结尾的 ? 丢掉原始 query，避免 Location 里令牌拼两遍
+        rewrite "^/whip/__ROOM__(.*)$" /r-__ROOM__/whip$1? break;
+        proxy_pass http://127.0.0.1:__MTX_WEBRTC_PORT__;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_request_buffering off;
+        client_max_body_size 1m;
+
+        # OBS 停播时会往 Location 发 DELETE。令牌漏掉或拼重复的话 DELETE 收 401，
+        # 会话要等 ICE 超时（约 30 秒）才从服务端消失。
+        proxy_redirect ~^https?://[^/]+/r-([a-z0-9]+)/whip([^?]*)(\?.*)?$ /whip/$1$2?k=__PUBLISH_TOKEN__;
+        proxy_redirect ~^/r-([a-z0-9]+)/whip([^?]*)(\?.*)?$ /whip/$1$2?k=__PUBLISH_TOKEN__;
+    }
+
+    # ---- LL-HLS：兜底观看 ----
+    #
+    # hls.js 请求分片时**不会**把播放列表上的 query 带过去，所以令牌走 cookie：
+    # 第一个带 ?k= 的请求种下 cookie，后面的分片靠 cookie 通过。
+    location ~ "^/hls/__ROOM__/(.+)$" {
+        set $sc_ok 0;
+        if ($arg_k = "__VIEW_TOKEN__")     { set $sc_ok 1; }
+        if ($cookie_sc_k = "__VIEW_TOKEN__") { set $sc_ok 1; }
+        if ($sc_ok = 0) { return 401; }
+
+        add_header Set-Cookie "sc_k=__VIEW_TOKEN__; Path=/; Max-Age=43200; SameSite=Lax" always;
+
+        # 把 query 整个换成固定的 cookieCheck=1，**但必须把 session 留下来**。
+        #
+        # 注意**不能**写成 rewrite 替换串里带 ?cookieCheck=1：nginx 的 rewrite 在替换串
+        # 自带参数时，会把原来的参数再追加到后面。于是令牌和客户端参数会一轮轮累积
+        # （旧项目实测 init 分片堆到 3 个 cookieCheck、4 个 k），#EXT-X-MAP 每次刷新都在变，
+        # 客户端就反复重下 init 分片。直接改写 $args 才是干净的。
+        #
+        # 为什么要 cookieCheck：MediaMTX 的 HLS 在请求没有 cookieCheck 参数时会 302 到
+        # 「同一地址 + ?cookieCheck=1」，且它只认查询参数不认 cookie。补上就省掉播放列表
+        # 和每一个分片各绕一次重定向。
+        #
+        # ⚠ 为什么必须留 session：MediaMTX 1.21 改了 HLS —— master 播放列表里的变体地址长
+        # 这样 `video1_stream.m3u8?session=<uuid>`，**变体播放列表和分片都靠这个 session
+        # 认会话**。旧项目那版跑的是 1.17.1，把 query 整个换掉没事；照抄到这里就变成
+        # 「master 能拿到、变体一律 401」——而且那个 401 是 MediaMTX 用 JSON 回的，
+        # 不是 nginx 的 HTML 401，很容易误判成令牌校验的问题（实测踩过）。
+        # 其余参数（我们的令牌、hls.js 的 _HLS_msn 之类）照样丢掉：
+        # MediaMTX 会把收到的 query 原样拼进播放列表里的子地址，留着就会滚雪球。
+        # 先把 session 快照下来，再改写 $args —— 顺序不能反。
+        # nginx 的 set/if/rewrite 都跑在 rewrite 阶段，**按配置里出现的顺序执行**；
+        # 先 set $args 的话，$arg_session 就是从新 query 里取值，永远是空的，
+        # 那个 if 一次都不会成立（第一版就这么写的，结果变体照样 401）。
+        set $sc_session $arg_session;
+        set $args "cookieCheck=1";
+        if ($sc_session != "") {
+            set $args "cookieCheck=1&session=$sc_session";
+        }
+        rewrite "^/hls/__ROOM__/(.*)$" /r-__ROOM__/$1 break;
+
+        # 这里不能带 URI，否则上面的 rewrite 结果会被丢掉
+        proxy_pass http://127.0.0.1:__MTX_HLS_PORT__;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_redirect ~^/r-([a-z0-9]+)/(.+)$ /hls/$1/$2;
+    }
+
+    # ---- 兜底：房间号写死之后，别的房间一律 404 ----
+    #
+    # 必须放在上面三条**后面** —— nginx 的正则 location 按出现顺序匹配，先到先得。
+    # 不加这条的话 /whep/<乱写的房间> 会掉进下面的静态文件 location，返回 200 + index.html，
+    # 客户端拿到一坨 HTML 当 SDP 用，报错莫名其妙。
+    location ~ ^/(whep|whip|hls)/ { return 404; }
+}

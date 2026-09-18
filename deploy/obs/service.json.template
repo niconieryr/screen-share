@@ -1,0 +1,10 @@
+{
+    "type": "whip_custom",
+    "settings": {
+        "server": "__WHIP_URL__",
+        "use_auth": false,
+        "bwtest": false,
+        "service": "WHIP",
+        "bearer_token": ""
+    }
+}

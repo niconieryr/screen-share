@@ -1,0 +1,4 @@
+# vite 依赖 esbuild 的 postinstall 来落平台二进制，不放行的话 vite 直接跑不起来。
+# 只放行这一个，别的依赖的构建脚本一律不执行。
+allowBuilds:
+  esbuild: true

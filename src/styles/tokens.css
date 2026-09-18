@@ -1,0 +1,71 @@
+/* ============================================================================
+   屏幕共享 设计令牌 —— 平面化
+   规则：全局没有 box-shadow、没有渐变。层级只靠纯色块 + 1px 分隔线表达。
+   圆角克制在 2-4px，过渡只动 opacity / color / transform。
+   ========================================================================= */
+
+:root {
+  /* ---- 色板：只有这几个纯色，别再往里加 ---- */
+  --bg: #0b0b0d; /* 画布 */
+  --surface: #141417; /* 顶栏 / 控制栏 */
+  --surface-2: #1c1c20; /* hover、次级块 */
+  --surface-3: #26262b; /* 按下、轨道 */
+
+  --border: #2a2a30; /* 1px 分隔线 */
+  --border-strong: #3a3a42;
+
+  --fg: #f4f4f5; /* 对比度 17.9:1 */
+  --fg-muted: #a0a0a8; /* 7.4:1 */
+  --fg-dim: #6e6e76; /* 装饰性文字，不承载信息 */
+
+  --live: #e5484d; /* 开播中 */
+  --live-fg: #ffffff; /* 4.6:1 */
+  --ok: #30a46c; /* 连接正常 */
+  --warn: #f5a524; /* 降级 / 等待 */
+  --danger: #e5484d;
+  --focus: #5b8def; /* 键盘焦点环 */
+
+  /* ---- 圆角 ---- */
+  --r-sm: 2px;
+  --r-md: 4px;
+
+  /* ---- 间距 ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* ---- 字阶 ---- */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-base: 14px;
+  --fs-md: 16px;
+  --fs-lg: 20px;
+  --fs-xl: 28px;
+
+  /* ---- 动效 ---- */
+  --t-fast: 150ms;
+  --t-base: 200ms;
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+
+  /* ---- 字体 ----
+     刻意不自托管 webfont：界面以中文为主，拉丁 webfont 只能覆盖数字和英文，
+     省下的请求比那点字形差异值钱。技术感靠等宽数字 + 表格数字来给。 */
+  --font-ui: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC',
+    'Hiragino Sans GB', 'Noto Sans CJK SC', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Consolas,
+    'Liberation Mono', monospace;
+
+  /* ---- 结构尺寸 ---- */
+  --bar-top: 48px;
+  --bar-bottom: 56px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+    --t-base: 0ms;
+  }
+}

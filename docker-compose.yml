@@ -1,0 +1,70 @@
+services:
+  # 媒体服务器：OBS 用 WHIP 推进来，观众用 WHEP 拉出去，UDP 被封的观众自动走 LL-HLS。
+  # 全程零转码 —— 只有 Opus 音轨进、Opus 音轨出，H.264 原样转发。
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.0
+    container_name: screen-share-mediamtx
+    restart: unless-stopped
+
+    # 用 host 网络，理由有三：
+    #   1. 端口映射会让容器看到的来源 IP 变成网桥网关，MediaMTX 的 127.0.0.1 白名单就失效了
+    #   2. WebRTC 少穿一层 docker NAT，ICE 候选地址干净
+    #   3. 8888/8889/9996 在 mediamtx.yml 里已经绑死 127.0.0.1，公网进不来
+    network_mode: host
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      # 只读挂载，配置由 deploy.ps1 从 deploy/mediamtx.yml.template 渲染
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - ./data:/data
+
+    # 整机只有 1.9 GiB，必须设上限
+    mem_limit: 256m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 这里**没有** healthcheck，是查过之后的决定：官方镜像是 distroless，
+    # 里面连 sh 都没有（`docker run --entrypoint sh` 直接 exec 失败），放不进任何探针。
+    # 补偿手段是 restart 策略 + deploy/remote-install.sh 末尾从宿主机打控制 API 自检。
+    # 别为了凑一个 healthcheck 去挂个 busybox 进去，那只会让排障更绕。
+
+  # 唯一入口：静态站 + 令牌校验 + 反代 MediaMTX。
+  # 80/443 是 AcePanel 的，所以对外只用 8443；上游全在 127.0.0.1。
+  edge:
+    image: nginx:1.27-alpine
+    container_name: screen-share-edge
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      # 直接覆盖镜像自带的 default.conf —— 那份会 listen 80，而 80 是面板的，
+      # 留着它容器根本起不来（host 网络下端口冲突是真的冲突）。
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./www:/opt/screen-share/www:ro
+
+    mem_limit: 64m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    depends_on:
+      - mediamtx

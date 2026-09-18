@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0B0B0D" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="屏幕共享 —— OBS 推流、网页观看" />
+    <title>屏幕共享</title>
+    <style>
+      /* 首屏底色写死在 HTML 里，避免 JS 加载前白闪一下 */
+      html,
+      body {
+        margin: 0;
+        background: #0b0b0d;
+        color: #f4f4f5;
+      }
+      #app {
+        min-height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
