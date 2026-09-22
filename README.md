@@ -1,5 +1,21 @@
 # screen-share
 
+> ⚠️ **2026-09-22 起本项目已被 [`srs`](../srs/) 取代，本仓库仅作回退保留。**
+>
+> 取代的原因：这套方案是为**亚秒延迟**设计的（WHIP→WHEP + UDP 媒体），而那个目标
+> 逼着推流端放弃 B 帧、`tune ll`、关掉 look-ahead —— 在 4 Mbps 固定出口下，
+> 这些恰好是画质的大头。改成「RTMP 进 → HLS 出、零转码」之后限制全部消失，
+> 观众也不再依赖 UDP。
+>
+> **回退方式**（旧的容器已停、文件原样留在 `/srv/screen-share/`）：
+>
+> ```powershell
+> cd ../srs && ./deploy/deploy.ps1 -Rollback
+> ```
+>
+> 回退演练在 2026-09-22 做过，可用。回退后观众入口是 `https://share.polarbear.net.cn/screen`，
+> OBS 要换回 WHIP 地址。
+
 OBS 推屏幕画面和声音，别人打开一条链接就能看。发起方只有你一个人，房间号是固化的。
 部署在腾讯云 CVM `43.142.33.45` 上，对外只有一条 **https 域名入口**：`https://share.polarbear.net.cn`。
 TLS 由面板的 nginx 在 443 上终止，容器侧的 edge 只绑回环 —— 明文那一段不出机器。
