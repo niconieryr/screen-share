@@ -17,7 +17,7 @@
  * 用法：
  *   node scripts/load-test.mjs              # 默认 4 路
  *   node scripts/load-test.mjs --n=10
- *   node scripts/load-test.mjs --n=10 --seconds=20 --base=http://43.142.33.45:8443
+ *   node scripts/load-test.mjs --n=10 --seconds=20 --base=https://share.polarbear.net.cn
  *   node scripts/load-test.mjs --publish-token=…
  *
  * 观看端是短链接公开访问：VIEW_TOKEN 为空（默认）时所有 WHEP 请求都不带 ?k=；
@@ -54,7 +54,7 @@ screen-share 并发压测（默认 N=4）
 选项：
   --n=<人数>              并发只收会话数（默认 4）
   --seconds=<秒>          码率采样时长（默认 15）
-  --base=<url>            对外地址（默认 http://43.142.33.45:8443）
+  --base=<url>            对外地址（默认 https://share.polarbear.net.cn）
   --room=<名字>           房间号（默认 share01）
   --view-token=<令牌>     观看令牌（默认环境变量 VIEW_TOKEN → .env）。留空 = 开放模式，
                           请求不带 ?k=；有值 = 受控模式，自动带上
@@ -105,7 +105,7 @@ async function main() {
   const reach = await checkReachable(config.base)
   if (!reach.ok) {
     report.record('目标可达', false, `${config.base} —— ${reach.error}`)
-    report.note('没部署 / 安全组和 ufw 没放行 8443 / 本机网络不通，都会长这样。')
+    report.note('没部署 / 面板站点没建好 / 证书没绑上 / 本机网络不通，都会长这样。')
     return report.summary('压测结果')
   }
   report.record('目标可达', true, `${config.base} → HTTP ${reach.status}（${reach.ms}ms）`)

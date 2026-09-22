@@ -4,7 +4,7 @@
  * 手写而不是引库：WHEP 本身就是「POST 一个 SDP offer，拿回一个 SDP answer」，
  * 引一个播放器框架反而多一层要调试的东西。
  *
- * 和这套部署（nginx 反代 + MediaMTX，全链路明文 http）的契约：
+ * 和这套部署（面板 nginx 终止 TLS → edge 反代 → MediaMTX）的契约：
  *
  *   POST   <origin>/whep/<房间>[?k=<令牌>]   Content-Type: application/sdp
  *   PATCH  <Location>                        Content-Type: application/trickle-ice-sdpfrag
@@ -14,9 +14,11 @@
  * 只有页面 URL 里带了 ?k=（受控模式）才透传上去。
  *
  * <Location> 是服务器用 Location 头回来的地址。MediaMTX 给的是**相对路径**
- * （/r-<房间>/whep/<会话>），nginx 用 proxy_redirect 把它改写成
- * /whep/<房间>/<会话>?k=<令牌>。所以这里**直接跟随 Location 原样请求**就对了 ——
- * 千万不要自己再拼一次 ?k=，令牌拼两遍会被 nginx 那条 401 拦掉，
+ * （/r-<房间>/whep/<会话>），edge 的 nginx 用 proxy_redirect 把它改写成
+ * /whep/<房间>/<会话>?k=<令牌>，并且 **absolute_redirect off** 保证它不会被
+ * 拼成「http://域名:8443/...」那种绝对地址 —— 否则页面在 https 下跟随它
+ * 就是 mixed content，浏览器直接拦掉。所以这里**直接跟随 Location 原样请求**
+ * 就对了 —— 千万不要自己再拼一次 ?k=，令牌拼两遍会被 nginx 那条 401 拦掉，
  * 会话就得等 ICE 超时（约 30 秒）才从服务端消失。
  */
 import { origin, withToken } from '@/lib/config'

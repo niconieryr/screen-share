@@ -35,7 +35,8 @@ services:
     # 别为了凑一个 healthcheck 去挂个 busybox 进去，那只会让排障更绕。
 
   # 唯一入口：静态站 + 令牌校验 + 反代 MediaMTX。
-  # 80/443 是 AcePanel 的，所以对外只用 8443；上游全在 127.0.0.1。
+  # 只绑回环（EDGE_BIND=127.0.0.1）：公网入口是面板 nginx 的 https://share.polarbear.net.cn
+  # （443，TLS 终止 + 反代到 127.0.0.1:8443）。上游全在 127.0.0.1。
   edge:
     image: nginx:1.27-alpine
     container_name: screen-share-edge
@@ -59,6 +60,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
+    # 探针打的是 edge 的回环端口（固定 8443）。真要改这个号，
+    # nginx 模板的 listen、面板站点「share」的反代目标要一起改。
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/healthz"]
       interval: 30s

@@ -1,19 +1,25 @@
-# screen-share 公网入口【模板】
+# screen-share 入口【模板】
 #
 # 这份配置跑在 **screen-share-edge 容器**里（nginx:1.27-alpine，host 网络），
 # 由 deploy/deploy.ps1 渲染后推到服务器上的 /srv/screen-share/nginx.conf，
 # 再挂进容器覆盖镜像自带的 default.conf。要改就改这里，别改服务器上那份。
 #
-# 绑在 __PUBLIC_HOST__:__PUBLIC_PORT__ 上，**明文 http**：
-#   - 80/443 被 AcePanel 占着，我们用 8443（安全组已放行）。
-#   - 没有域名也就签不了真证书，而 OBS 对 HTTPS 的 WHIP 会**静默拒绝自签证书**，
-#     所以不做自签 HTTPS —— OBS 的 WHIP 本来就支持 http://，浏览器侧拉流
-#     （WHEP/HLS）也验证过不要求安全上下文。代价见 README。
+# 绑在 __EDGE_BIND__:8443 上，**明文 http，但默认只绑回环** —— 公网唯一入口是
+# 面板 nginx 的 https://__PUBLIC_HOST__（443，泛域名真证书）：
 #
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/__VIEW_PATH__        观看页（打开就能看）
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whep/__ROOM__        浏览器拉流（主路径，<1s）
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/hls/__ROOM__/...     LL-HLS 兜底（2-4s）
-#   http://__PUBLIC_HOST__:__PUBLIC_PORT__/whip/__ROOM__?k=...  OBS 推流（这条带令牌）
+#   浏览器 / OBS ──https://__PUBLIC_HOST__──▶ 面板 nginx:443（TLS 终止 + Host 路由）
+#                                              └─▶ 127.0.0.1:8443 这个 edge（明文不出机器）
+#
+#   https://__PUBLIC_HOST__/__VIEW_PATH__        观看页（打开就能看）
+#   https://__PUBLIC_HOST__/whep/__ROOM__        浏览器拉流（主路径，<1s）
+#   https://__PUBLIC_HOST__/hls/__ROOM__/...     LL-HLS 兜底（2-4s）
+#   https://__PUBLIC_HOST__/whip/__ROOM__?k=...  OBS 推流（这条带令牌）
+#
+# 为什么 edge 自己不做 TLS：443 是面板的，证书（一张 *.polarbear.net.cn 泛域名证书，
+# 面板 ACME 每日自动续签并铺到全部站点）也归面板管。edge 只绑回环、明文这一段不出机器，
+# 再签一张证书没有意义。历史上这里是「没有域名 → 只能明文 http + IP:8443」，
+# 那条路 2026-09-22 退役：腾讯云会按未备案域名拦明文 http（连非标端口一起拦），
+# 而 8443 这种非标端口本来也容易被运营商降优先级。
 #
 # 观看侧**不校验令牌**（`VIEW_TOKEN` 留空时的行为）：链接要能口头念、能手打，
 # 所以只有推流侧保留令牌 —— 那个不能公开，否则别人能顶掉你的推流。
@@ -25,8 +31,24 @@
 # ⚠ 静态站根目录写死 /opt/screen-share/www，和 compose 里的挂载点一致。
 
 server {
-    listen __PUBLIC_PORT__;
+    listen __EDGE_BIND__:8443;
     server_name _;
+
+    # ⚠ 这个必须关掉，否则域名入口会跳出一个「需要备案」页。
+    #
+    # nginx 默认 absolute_redirect on：任何以 / 开头的 Location 都会被它用
+    # 「请求的 Host 头 + 自己的监听端口」拼成绝对地址（源码见
+    # ngx_http_header_filter_module.c，判据只有「以 / 开头」+ 这个开关，不看状态码）。
+    # 本配置同时被两条路复用，绝对化必然有一条是错的：
+    #   - 面板反代进来（Host: __PUBLIC_HOST__）→ 拼成 http://__PUBLIC_HOST__:8443/...
+    #     → 浏览器被踢出 TLS，而腾讯云按未备案域名拦明文 http，表现就是
+    #       打开域名看到 dnspod 那个「需要备案」页（2026-09-22 实测踩到）；
+    #   - WHEP 建会话的 201 Location（MediaMTX 回的是相对路径，被下面几条
+    #     proxy_redirect 改写后仍然以 / 开头）同样会被绝对化 → 前端原样跟随它去
+    #     PATCH/DELETE 时，浏览器按 mixed content 拦掉，会话残留到 ICE 超时。
+    # 关掉之后一律发相对地址，两种访问模式各自解析都对：
+    #   IP 模式 → http://43.142.33.45:8443/...，域名模式 → https://__PUBLIC_HOST__/...
+    absolute_redirect off;
 
     root  /opt/screen-share/www;
     index index.html;
@@ -65,7 +87,9 @@ server {
         add_header Cache-Control "no-store, must-revalidate";
     }
 
-    # 手打 IP:端口进来顺手跳到观看页（少记一段路径）
+    # 手打域名进来顺手跳到观看页（少记一段路径）。
+    # 这里发的是**相对**地址，靠上面的 absolute_redirect off 兜住 —— 别改成绝对地址，
+    # 也别忘了那个开关，否则访客会被踢到明文 http 上去（见文件开头那段注释）。
     location = / {
         return 302 /__VIEW_PATH__;
     }

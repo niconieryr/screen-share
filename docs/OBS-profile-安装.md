@@ -60,11 +60,11 @@ OBS 永远看不到的 profile，用户会以为脚本坏了。
 
 `service.json` 里的 `server` 就是推流地址，**含推流令牌**：
 
-- `-PublishUrl 'http://host:8443/whip/<房间>?k=<令牌>'` 直接给完整地址；不给则从项目根
-  `.env` 的 `PUBLIC_HOST` / `PUBLIC_PORT` / `ROOM` / `PUBLISH_TOKEN` 拼
-- 协议：`-Scheme auto`（默认）时端口 443 用 `https`，其余用 `http` —— 本项目是
-  **明文 http + IP 端口**（没有域名就签不了真证书，而 OBS 对 HTTPS 的 WHIP 会静默
-  拒绝自签证书，见 README）
+- `-PublishUrl 'https://share.polarbear.net.cn/whip/<房间>?k=<令牌>'` 直接给完整地址；不给则从项目根
+  `.env` 的 `PUBLIC_URL` / `ROOM` / `PUBLISH_TOKEN` 拼
+- 协议：`-Scheme auto`（默认）跟着 `.env` 的 `PUBLIC_URL` 走 —— 现在对外只有
+  **https 域名入口**（面板 nginx 在 443 上终止 TLS，真证书，OBS 直接认），
+  所以正常情况根本不用碰这个开关
 - 真实令牌**只落进 `%APPDATA%` 下的 profile**（仓库外），**不入库**；控制台默认打码
   （`k=4c36…a80e`），要看全加 `-ShowPublishUrl`。仓库里只有 `service.json.template`
   这个带 `__WHIP_URL__` 占位符的模板

@@ -88,12 +88,31 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 
 $config = Read-DotEnv -Path $envPath
 $required = @(
-    'PUBLIC_HOST', 'PUBLIC_PORT', 'ADVERTISE_IP',
+    'PUBLIC_URL', 'EDGE_BIND', 'ADVERTISE_IP',
     'ROOM', 'PUBLISH_TOKEN',
     'MTX_HLS_PORT', 'MTX_WEBRTC_PORT', 'MTX_API_PORT', 'MTX_WEBRTC_UDP_PORT'
 )
 $missing = $required | Where-Object { -not $config.ContainsKey($_) -or [string]::IsNullOrWhiteSpace($config[$_]) }
 if ($missing) { throw ".env 里缺少这些键：$($missing -join ', ')" }
+
+# 对外入口：域名 + 真证书，TLS 在面板 nginx 的 443 上终止（edge 自己只绑回环，见 EDGE_BIND）。
+$publicUrl = $config['PUBLIC_URL'].Trim().TrimEnd('/')
+if ($publicUrl -notmatch '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$') {
+    throw "PUBLIC_URL '$($config['PUBLIC_URL'])' 不合法：写成 https://share.polarbear.net.cn 这样（scheme + host，不带路径、不带末尾斜杠）。"
+}
+$publicHost = ($publicUrl -replace '^https?://', '') -replace ':.*$', ''
+if ($publicUrl -notmatch '^https://') {
+    Write-Warn2 'PUBLIC_URL 不是 https：明文 http 入口会被腾讯云按未备案域名拦掉（2026-09-22 实测）。'
+}
+
+# edge 监听地址：默认只绑回环 —— 公网唯一入口是面板那条 443。
+$edgeBind = $config['EDGE_BIND'].Trim()
+if ($edgeBind -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+    throw "EDGE_BIND '$edgeBind' 不是 IPv4 地址（回环写 127.0.0.1；临时开放写 0.0.0.0）。"
+}
+if ($edgeBind -ne '127.0.0.1') {
+    Write-Warn2 "EDGE_BIND=${edgeBind}：edge 会对公网监听 8443，明文 http 入口重新暴露（安全组里那条规则还在）。"
+}
 
 if ($config['ROOM'] -notmatch '^[a-z0-9]{6,32}$') {
     throw "ROOM '$($config['ROOM'])' 不合法：只允许小写字母和数字，长度 6-32 位（要和 nginx 正则一致）。"
@@ -142,13 +161,14 @@ if ($viewToken) {
     $viewMode = '开放（谁拿到链接都能看）'
 }
 
-$base = "http://$($config['PUBLIC_HOST']):$($config['PUBLIC_PORT'])"
+$base = $publicUrl
 $watchUrl = "$base/$viewPath"
 if ($viewToken) { $watchUrl += "?k=$viewToken" }
 
 Write-Step '0/6 检查配置'
 Write-Ok "对外 $base，房间 $($config['ROOM'])"
 Write-Ok "观看 $watchUrl（$viewMode）"
+Write-Ok "edge 监听 ${edgeBind}:8443（面板 nginx 反代到这里）"
 
 # ------------------------------------------------------------------ 2. 构建
 
@@ -176,8 +196,10 @@ Write-Step '2/6 渲染配置模板'
 New-Item -ItemType Directory -Force -Path $renderedDir | Out-Null
 
 $values = @{
-    PUBLIC_HOST         = $config['PUBLIC_HOST']
-    PUBLIC_PORT         = $config['PUBLIC_PORT']
+    # 模板注释里出现的域名（= PUBLIC_URL 的 host 部分）
+    PUBLIC_HOST         = $publicHost
+    # edge 只绑这个地址；默认回环，公网入口由面板的 443 负责
+    EDGE_BIND           = $edgeBind
     # WebRTC 的 ICE 候选用 IP，不用域名 —— 理由见 mediamtx.yml.template
     ADVERTISE_IP        = $config['ADVERTISE_IP']
     # 房间号是固化的：nginx 的正则、MediaMTX 的 paths、前端构建，三处用的是同一个值
@@ -251,7 +273,7 @@ try {
 # ------------------------------------------------------------------ 5. 远端安装
 
 Write-Step '4/6 远端安装并启动'
-$installArgs = "$remoteDir/remote-install.sh $($config['MTX_API_PORT']) $($config['PUBLIC_PORT']) $($config['PUBLIC_HOST']) $($config['MTX_WEBRTC_UDP_PORT'])"
+$installArgs = "$remoteDir/remote-install.sh $($config['MTX_API_PORT']) $($config['MTX_WEBRTC_UDP_PORT']) $publicUrl"
 if ($noRecreate) { $installArgs += ' --no-recreate' }
 Invoke-Checked -Command 'ssh' -Arguments @($HostAlias, "bash $installArgs") -What '远端安装'
 
@@ -275,4 +297,9 @@ if ($viewToken) {
     Write-Warn2 "想收回：把 .env 的 VIEW_PATH 改成随机串（如 $viewPath-$([guid]::NewGuid().ToString('N').Substring(0,6))）重跑部署。"
 }
 Write-Warn2 '推流令牌（OBS 那条）千万不能外发，否则别人能顶掉你的推流。'
-Write-Warn2 "WebRTC 媒体走 UDP $($config['MTX_WEBRTC_UDP_PORT'])，腾讯云安全组入站要放行（对外的 $($config['PUBLIC_PORT'])/tcp 本来就在安全组里）。"
+Write-Warn2 "WebRTC 媒体走 UDP $($config['MTX_WEBRTC_UDP_PORT'])，腾讯云安全组入站要放行，否则观众只能走 HLS 兜底（2-4 秒）。"
+if ($edgeBind -eq '127.0.0.1') {
+    Write-Warn2 "公网入口只有 $base（面板 nginx 的 443）；edge 只绑回环，IP:8443 那条路已关，安全组里 8443/tcp 那条规则可以删了。"
+} else {
+    Write-Warn2 "edge 绑在 ${edgeBind}:8443 —— 明文 http 入口是开着的，用完记得改回 127.0.0.1 重跑部署。"
+}

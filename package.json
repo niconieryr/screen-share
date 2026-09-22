@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OBS 推流 / 网页观看的极简屏幕共享（腾讯云单端口明文部署）",
+  "description": "OBS 推流 / 网页观看的极简屏幕共享（腾讯云 https 域名入口）",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

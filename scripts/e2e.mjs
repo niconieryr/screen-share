@@ -5,11 +5,11 @@
  * 用真实浏览器**自己合成**一路 WHIP 推流（canvas 画移动方块 + 振荡器出 440Hz），
  * 不碰分享者的屏幕，也不需要 OBS / ffmpeg 在场；然后开一个观看页去接，逐项验收。
  *
- * 只跟对外 URL 打交道，全程明文 http，不需要 ssh、不碰远端主机。
+ * 只跟对外 URL 打交道（https 域名入口），不需要 ssh、不碰远端主机。
  * 目标地址 / 令牌的取值顺序：命令行 > 环境变量 > .env > 内置默认值（见 --help）。
  *
  * 用法：node scripts/e2e.mjs
- *      node scripts/e2e.mjs --base=http://43.142.33.45:8443 --view-token=... --publish-token=...
+ *      node scripts/e2e.mjs --base=https://share.polarbear.net.cn --view-token=... --publish-token=...
  *      CHROME_PATH=... node scripts/e2e.mjs        # 指定浏览器
  *
  * 退出码 0 = 全过，1 = 有失败（含「压根连不上」这种前置失败）。
@@ -44,7 +44,7 @@ screen-share 端到端验收
   node scripts/e2e.mjs [选项]
 
 选项：
-  --base=<url>            对外地址（默认 http://43.142.33.45:8443）
+  --base=<url>            对外地址（默认 https://share.polarbear.net.cn）
   --room=<名字>           房间号（默认 share01，nginx 里是固化的）
   --view-path=<路径>      观看短链接的路径段（默认 screen，即 /screen）
   --view-token=<令牌>     观看令牌（默认取环境变量 VIEW_TOKEN，再取 .env 的 VIEW_TOKEN）
@@ -186,7 +186,7 @@ async function main() {
   const watchdogMs = (Number.parseFloat(args.flags.timeout ?? '300') || 300) * 1000
 
   const report = createReporter()
-  console.log('screen-share 端到端验收（明文 http，无域名无证书）')
+  console.log('screen-share 端到端验收（https 域名入口，面板 nginx 终止 TLS）')
   report.info(`目标     ${config.base}（来自 ${config.baseFrom}）`)
   report.info(`房间     ${config.room}（来自 ${config.roomFrom}）`)
   report.info(`观看入口 ${config.viewerURL}（路径来自 ${config.viewPathFrom}）`)
@@ -199,8 +199,8 @@ async function main() {
   const reach = await checkReachable(config.base)
   if (!reach.ok) {
     report.record('目标可达', false, `${config.base} —— ${reach.error}`)
-    report.note('没部署 / 安全组和 ufw 没放行 8443 / 本机网络不通，都会长这样。')
-    report.note(`换个地址：--base=http://主机:端口，或设 SHARE_BASE、或在 .env 里写 PUBLIC_HOST/PUBLIC_PORT。`)
+    report.note('没部署 / 面板站点没建好 / 证书没绑上 / 本机网络不通，都会长这样。')
+    report.note(`换个地址：--base=https://域名，或设 SHARE_BASE、或在 .env 里写 PUBLIC_URL。`)
     return report.summary()
   }
   report.record('目标可达', true, `${config.base} → HTTP ${reach.status}（${reach.ms}ms）`)

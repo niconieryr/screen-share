@@ -28,7 +28,7 @@
 
   令牌：service.json 的推流地址里带 PUBLISH_TOKEN。
     - 给了 -PublishUrl 就用它；否则从项目根 .env 的
-      PUBLIC_HOST / PUBLIC_PORT / ROOM / PUBLISH_TOKEN 拼出来
+      PUBLIC_URL / ROOM / PUBLISH_TOKEN 拼出来
     - 真实令牌只落进 %APPDATA% 下的 profile（仓库外），**不入库、不打印**：
       控制台默认打码（k=4c36…a80e），要看全地址加 -ShowPublishUrl
     - .env 里还是 changeme-* 模板值时给黄色警告，不拦
@@ -52,7 +52,7 @@
   ./scripts/install-obs-profile.ps1 -ShowPublishUrl
 
 .EXAMPLE
-  ./scripts/install-obs-profile.ps1 -PublishUrl 'http://1.2.3.4:8443/whip/share01?k=<推流令牌>'
+  ./scripts/install-obs-profile.ps1 -PublishUrl 'https://share.polarbear.net.cn/whip/share01?k=<推流令牌>'
 
 .NOTES
   语法自检：
@@ -64,7 +64,8 @@ param(
     # 完整推流地址（含令牌）。给了就不再读 .env。
     [string]$PublishUrl,
 
-    # auto = 端口 443 用 https，其余用 http（本项目是明文 http + IP 端口）。
+    # auto = 跟着 .env 的 PUBLIC_URL 走 scheme（现在对外只有 https 域名入口）。
+    # 一般不用管这个开关，留着只是为了临时指到别处（本地调试、EDGE_BIND=0.0.0.0 的 IP 直连）。
     [ValidateSet('auto', 'http', 'https')]
     [string]$Scheme = 'auto',
 
@@ -176,7 +177,7 @@ function Sync-TextFile {
     return $true
 }
 
-# 令牌打码：http://host:8443/whip/room?k=4c36…a80e
+# 令牌打码：https://share.polarbear.net.cn/whip/room?k=4c36…a80e
 function Protect-Url {
     param([string]$Url)
     $mark = $Url.IndexOf('?')
@@ -338,22 +339,22 @@ if ($PublishUrl) {
         Fail "找不到 $envPath。先 Copy-Item .env.example .env 并填好两个令牌（或者直接传 -PublishUrl）。"
     }
     $config = Read-DotEnv -Path $envPath
-    foreach ($key in @('PUBLIC_HOST', 'PUBLIC_PORT', 'ROOM', 'PUBLISH_TOKEN')) {
+    foreach ($key in @('PUBLIC_URL', 'ROOM', 'PUBLISH_TOKEN')) {
         if (-not $config.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($config[$key])) {
             Fail "$envPath 里缺少 $key"
         }
     }
 
-    $port = $config['PUBLIC_PORT']
+    # 对外只有一条 https 域名入口（面板 nginx 在 443 上终止 TLS），地址直接由 PUBLIC_URL 拼。
+    $publicUrl = $config['PUBLIC_URL'].Trim().TrimEnd('/')
     $useScheme = switch ($Scheme) {
         'http'  { 'http' }
         'https' { 'https' }
-        default { if ($port -eq '443') { 'https' } else { 'http' } }
+        default { if ($publicUrl -match '^https://') { 'https' } else { 'http' } }
     }
-    $defaultPort = if ($useScheme -eq 'https') { '443' } else { '80' }
-    $authority = if ($port -eq $defaultPort) { $config['PUBLIC_HOST'] } else { "$($config['PUBLIC_HOST']):$port" }
+    $authority = $publicUrl -replace '^https?://', ''
     $whipUrl = "$useScheme`://$authority/whip/$($config['ROOM'])`?k=$($config['PUBLISH_TOKEN'])"
-    Write-Ok "来源：$envPath（PUBLIC_HOST / PUBLIC_PORT / ROOM / PUBLISH_TOKEN）"
+    Write-Ok "来源：$envPath（PUBLIC_URL / ROOM / PUBLISH_TOKEN）"
 
     if ($whipUrl -match 'changeme') {
         Write-Warn '.env 里还是 changeme-* 模板值，先把两个令牌换成随机值再装（现在装的地址推不上去）'
@@ -361,7 +362,7 @@ if ($PublishUrl) {
 }
 
 if ($whipUrl -notmatch '^https?://[^/]+/.+') {
-    Fail "推流地址不像话：$(Protect-Url $whipUrl)（要形如 http://host:port/whip/<房间>?k=<令牌>）"
+    Fail "推流地址不像话：$(Protect-Url $whipUrl)（要形如 https://<域名>/whip/<房间>?k=<令牌>）"
 }
 if (-not $ShowPublishUrl) {
     Write-Ok "推流地址 $(Protect-Url $whipUrl)   ← 已打码，-ShowPublishUrl 看全"

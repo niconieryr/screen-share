@@ -23,7 +23,7 @@ export interface Session {
   token: string
 }
 
-/** 当前 origin，例如 http://43.142.33.45:8443 —— 全链路明文 http，没有域名也没有证书 */
+/** 当前 origin，例如 https://share.polarbear.net.cn —— 对外只有这一条 https 域名入口 */
 export function origin(): string {
   return window.location.origin
 }
@@ -63,7 +63,7 @@ export function buildWatchUrl(token = ''): string {
 /**
  * 从用户粘贴的东西里抠出令牌 —— 只有受控模式下的门禁会用到。
  *
- * 分享链接长这样：http://43.142.33.45:8443/screen?k=<一串令牌>。
+ * 分享链接长这样：https://share.polarbear.net.cn/screen?k=<一串令牌>。
  * 但不是所有人都会整条复制：有人只复制 ?k= 后面那一段，
  * 有人从聊天软件里连首尾的尖括号 / 引号一起复制进来。
  * 所以先当链接解，解不出来再当裸令牌收。

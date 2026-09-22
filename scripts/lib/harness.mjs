@@ -6,9 +6,10 @@
  *
  * 和旧项目（sharecast）比，这一版有几处是**新部署形态逼出来的**改动：
  *
- *   1. 全链路**明文 http**：没有域名、没有证书，对外只有 IP + 端口
- *      （默认 http://43.142.33.45:8443）。所以 baseUrl() 一律拼 http://，
- *      绝不写 https —— OBS 会**静默拒绝自签证书**，假装有 TLS 只是自欺欺人。
+ *   1. 对外只有**一条** https 域名入口（默认 https://share.polarbear.net.cn，
+ *      TLS 在腾讯云面板 nginx 的 443 上终止，edge 只绑回环）。
+ *      所以 baseUrl() 读的是 .env 的 PUBLIC_URL，不再拼 host:port。
+ *      （2026-09-22 之前是明文 http + IP:8443，那条路已经退役。）
  *   2. **没有任何 ssh**：脚本只跟对外 URL 打交道。服务端的容器 CPU、网卡
  *      出口字节这些指标一概不取（旧项目靠 ssh + docker stats，这里刻意去掉），
  *      出口带宽改成「把每一路实测码率加起来」，这本来就更贴近真实占用。
@@ -22,11 +23,11 @@ import { fileURLToPath } from 'node:url'
 /** 项目根目录（scripts/lib/../..） */
 export const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
-/** 默认目标：没有域名、没有证书，只有 IP + 端口，明文 http */
-export const DEFAULT_BASE = 'http://43.142.33.45:8443'
+/** 默认目标：唯一入口就是这条 https 域名（面板 nginx 的 443，真证书） */
+export const DEFAULT_BASE = 'https://share.polarbear.net.cn'
 /** 房间号在新部署里是固化的：nginx 只认这一个，MediaMTX 那边叫 r-share01 */
 export const DEFAULT_ROOM = 'share01'
-/** 观看端的短链接路径：http://43.142.33.45:8443/screen —— 公开访问，不带令牌 */
+/** 观看端的短链接路径：https://share.polarbear.net.cn/screen —— 公开访问，不带令牌 */
 export const DEFAULT_VIEW_PATH = 'screen'
 /** 出口带宽（最硬的约束）：4 Mbps。留给观众的上限，不是目标值 */
 export const EGRESS_BUDGET_MBPS = 4
@@ -59,11 +60,17 @@ export function loadEnv() {
   return map
 }
 
-/** 去掉末尾斜杠、补上 scheme。命令行里写 43.142.33.45:8443 也能用。 */
+/**
+ * 去掉末尾斜杠、补上 scheme。
+ * 命令行里写 `share.polarbear.net.cn` 也能用（按域名走 https）；
+ * 写 `43.142.33.45:8443` 这种 IP 形式则按 http —— 那是 EDGE_BIND=0.0.0.0
+ * 的临时直连形态，不是日常入口。
+ */
 export function normalizeBase(value) {
   const trimmed = String(value ?? '').trim().replace(/\/+$/, '')
   if (!trimmed) return DEFAULT_BASE
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
+  if (/^https?:\/\//i.test(trimmed)) return trimmed
+  return /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(trimmed) ? `http://${trimmed}` : `https://${trimmed}`
 }
 
 /**
@@ -83,18 +90,14 @@ export function withToken(url, token) {
 }
 
 /**
- * 从 .env 的 PUBLIC_HOST / PUBLIC_PORT 拼对外地址。
- * 刻意是 http：这台机器没域名，自签证书 OBS 不认，所以整套就是明文跑。
+ * 从 .env 的 PUBLIC_URL 取对外地址 —— 现在只有一条 https 域名入口。
+ * .env 还没生成时给内置默认值，绝不抛异常。
  */
 export function baseUrl(env = loadEnv()) {
-  const host = String(env.PUBLIC_HOST ?? '')
+  const url = String(env.PUBLIC_URL ?? '')
     .trim()
-    .replace(/^https?:\/\//i, '')
     .replace(/\/+$/, '')
-  if (!host) return DEFAULT_BASE
-  if (/:\d+$/.test(host)) return `http://${host}` // host 自带端口
-  const port = String(env.PUBLIC_PORT ?? '').trim()
-  return port ? `http://${host}:${port}` : `http://${host}`
+  return url ? normalizeBase(url) : DEFAULT_BASE
 }
 
 /** `--key=value` / `--flag` 解析。不做花哨的短选项。 */
@@ -134,8 +137,7 @@ export function resolveConfig(args, { need = [] } = {}) {
   let baseFrom = '内置默认值'
   if (baseFlag) [base, baseFrom] = [normalizeBase(baseFlag), '命令行 --base']
   else if (baseEnv) [base, baseFrom] = [normalizeBase(baseEnv), '环境变量 SHARE_BASE']
-  else if (text(env.PUBLIC_HOST) || text(env.PUBLIC_PORT))
-    [base, baseFrom] = [baseUrl(env), '.env（PUBLIC_HOST/PUBLIC_PORT）']
+  else if (text(env.PUBLIC_URL)) [base, baseFrom] = [baseUrl(env), '.env（PUBLIC_URL）']
 
   const roomFlag = text(flags.room)
   const roomEnv = text(process.env.ROOM)

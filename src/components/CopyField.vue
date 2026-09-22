@@ -6,9 +6,10 @@
  *（看的人自己就是被分享来的，不需要再看到链接）。留着是因为下面那套降级逻辑
  * 是踩过坑写出来的，将来要在别处（比如开播台）再放分享条，直接拿来用即可。
  *
- * 复制这件事在这套部署里必须做三道兜底：对外入口是 http://<IP>:<端口>，
- * **不是安全上下文（secure context）**，很多浏览器里 navigator.clipboard 直接
- * 就是 undefined，只写 clipboard API 等于没写。
+ * 复制这件事保留三道兜底。对外入口现在是 https 域名（安全上下文，第 1 条直接可用），
+ * 但 `.env` 的 EDGE_BIND 一改成 0.0.0.0 就退回 http://<IP>:<端口> 那种
+ * **非安全上下文** —— 那时 navigator.clipboard 在很多浏览器里就是 undefined，
+ * 只写 clipboard API 等于没写。所以三条路都留着：
  *   1. navigator.clipboard.writeText —— https / localhost 下最干净
  *   2. 隐藏 textarea + document.execCommand('copy') —— http 下的老办法，还能用
  *   3. 都不行就把框里的文本全选上，让用户自己按 Ctrl+C
@@ -111,7 +112,8 @@ async function copy(): Promise<void> {
   }
 
   // 第一道：安全上下文（https / localhost）里才有 navigator.clipboard。
-  // 这套部署是 http://<IP>:<端口>，绝大多数浏览器里它直接是 undefined。
+  // 现在入口是 https 域名，这条就是主路径；只有 EDGE_BIND=0.0.0.0 的 IP 直连形态下
+  // 它才会是 undefined，那时往下走第 2、3 条。
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text)
